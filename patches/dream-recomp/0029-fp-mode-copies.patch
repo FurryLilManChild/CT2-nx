@@ -1,0 +1,267 @@
+diff --git a/tests/sh4/CMakeLists.txt b/tests/sh4/CMakeLists.txt
+index ab43c15..51d1d7f 100644
+--- a/tests/sh4/CMakeLists.txt
++++ b/tests/sh4/CMakeLists.txt
+@@ -81,6 +81,56 @@ target_include_directories(dream_sh4_runner PRIVATE ${_gen_dir})
+ target_link_libraries(dream_sh4_runner PRIVATE dream::runtime)
+ dream_target_defaults(dream_sh4_runner)
+ 
++# CTDC-nx: FP-mode copies (translator EmitOptions::fp_mode_copies). The FPU programs are entered
++# from outside the analysis, so their entry mode is unknown and they get one copy per FPSCR.PR/SZ
++# mode behind a dispatch. A second runner holds the same programs translated without copies (the
++# runtime-tested generic body only); the test runs both from every PR/SZ entry mode and requires
++# identical final state and memory. The in-process tests above only reach the PR=0 SZ=0 copy.
++set(_nocopy_dir ${CMAKE_CURRENT_BINARY_DIR}/gen_nocopies)
++file(MAKE_DIRECTORY ${_nocopy_dir})
++set(_nocopy_sources)
++set(_nocopy_umbrella "// Generated. Do not edit.\n#pragma once\n")
++set(_nocopy_table)
++foreach(prog p5_fpu:fpu p7_fpuedge:fpuedge)
++  string(REPLACE ":" ";" prog "${prog}")
++  list(GET prog 0 name)
++  list(GET prog 1 fn)
++  foreach(entry IN LISTS DREAM_SH4_PROGRAMS)
++    string(REPLACE "|" ";" entry "${entry}")
++    list(GET entry 0 ename)
++    if(ename STREQUAL name)
++      list(GET entry 2 base)
++      list(GET entry 3 specs)
++    endif()
++  endforeach()
++  set(src ${_nocopy_dir}/${name}.cpp)
++  set(hdr ${_nocopy_dir}/${name}.h)
++  add_custom_command(
++    OUTPUT ${src} ${hdr}
++    COMMAND dream-translate emit --image ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
++            --base ${base} --function ${specs} --no-fp-mode-copies --out ${src} --header ${hdr}
++    DEPENDS dream-translate ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
++            ${CMAKE_CURRENT_SOURCE_DIR}/programs/programs.cmake
++    COMMENT "Translating ${name} without FP-mode copies"
++    VERBATIM)
++  list(APPEND _nocopy_sources ${src})
++  string(APPEND _nocopy_umbrella "#include \"${name}.h\"\n")
++  string(APPEND _nocopy_table "    {\"${name}\", &dream::gen::${fn}},\n")
++endforeach()
++string(APPEND _nocopy_umbrella "\nnamespace dream::gen {\nstruct Program {\n    const char* name;\n    void (*entry)(dream::sh4::Ctx&, dream::Memory&);\n};\ninline constexpr Program kPrograms[] = {\n${_nocopy_table}};\n}  // namespace dream::gen\n")
++file(WRITE ${_nocopy_dir}/emitted_programs.h "${_nocopy_umbrella}")
++add_executable(dream_sh4_runner_nocopies runner.cpp ${_nocopy_sources})
++target_include_directories(dream_sh4_runner_nocopies PRIVATE ${_nocopy_dir})
++target_link_libraries(dream_sh4_runner_nocopies PRIVATE dream::runtime)
++dream_target_defaults(dream_sh4_runner_nocopies)
++find_package(Python3 COMPONENTS Interpreter)
++if(Python3_Interpreter_FOUND)
++  add_test(NAME translator.fp_mode_copies
++    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fp_mode_copies.py
++            --with $<TARGET_FILE:dream_sh4_runner> --without $<TARGET_FILE:dream_sh4_runner_nocopies>
++            --programs ${CMAKE_CURRENT_SOURCE_DIR}/programs)
++endif()
++
+ # Differential test against Flycast's interpreter (docs/differential-harness.md); opt-in because it
+ # needs the locally built oracle core.
+ if(DREAM_FLYCAST_CORE)
+diff --git a/tests/sh4/fp_mode_copies.py b/tests/sh4/fp_mode_copies.py
+new file mode 100644
+index 0000000..a7490d5
+--- /dev/null
++++ b/tests/sh4/fp_mode_copies.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""CTDC-nx: differential check of the translator's FP-mode copies.
++
++Runs each FPU test program in two runners, one translated with FP-mode copies and one without, from
++every FPSCR.PR/SZ entry mode, and requires the same final context and memory hash from both.
++"""
++import argparse
++import os
++import subprocess
++import sys
++import tempfile
++
++PROGRAMS = [("p5_fpu", "p5_fpu.bin", "0x8c010000"), ("p7_fpuedge", "p7_fpuedge.bin", "0x8c010000")]
++# Katana default (DN=1, round toward zero) with each PR/SZ combination.
++MODES = [0x00040001, 0x000C0001, 0x00140001, 0x001C0001]
++BUF = "0x8c100000"
++
++
++def run(runner, programs_dir, name, binary, base, fpscr, out):
++    cmd = [runner, "--program", name, "--image", os.path.join(programs_dir, binary), "--base", base,
++           "--fpscr", hex(fpscr), "--reg", "r4=" + BUF, "--reg", "r15=0x8c00f400",
++           "--hash", BUF + ":0x100", "--out", out]
++    rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
++    body = open(out).read() if rc.returncode == 0 and os.path.exists(out) else ""
++    return rc.returncode, body
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--with", dest="with_", required=True)
++    ap.add_argument("--without", required=True)
++    ap.add_argument("--programs", required=True)
++    a = ap.parse_args()
++    failures = 0
++    with tempfile.TemporaryDirectory() as tmp:
++        for name, binary, base in PROGRAMS:
++            for fpscr in MODES:
++                r1 = run(a.with_, a.programs, name, binary, base, fpscr, os.path.join(tmp, "a.json"))
++                r2 = run(a.without, a.programs, name, binary, base, fpscr, os.path.join(tmp, "b.json"))
++                ok = r1 == r2 and r1[0] == 0
++                print(f"{name} fpscr={fpscr:#010x}: {'same' if ok else 'DIFFERENT'} (rc {r1[0]}/{r2[0]})")
++                if not ok:
++                    failures += 1
++                    print("with copies:\n" + r1[1] + "\nwithout:\n" + r2[1])
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/translator/include/dream/translator/emit.h b/translator/include/dream/translator/emit.h
+index 7a46513..c932b96 100644
+--- a/translator/include/dream/translator/emit.h
++++ b/translator/include/dream/translator/emit.h
+@@ -51,6 +51,9 @@ struct EmitOptions {
+     // SA-nx: guest general registers in host locals between calls, interrupt polls and returns
+     // (ADR 4), written back to the context around them. --no-local-regs turns it off.
+     bool local_regs = true;
++    // CTDC-nx: bodies that test FPSCR at run time are also emitted once per entry mode, picked
++    // at the plain entry (emit_unit). --no-fp-mode-copies turns it off.
++    bool fp_mode_copies = true;
+     bool overlay = false;    // table entries carry the code words they were translated from
+     // Split the unit's function bodies over this many translation units (SA-nx). A 6.7 MB binary
+     // emits about 160 MB of C++, which no compiler handles well as one file. Part 0 also holds the
+@@ -72,6 +75,7 @@ struct EmitResult {
+     std::size_t instructions = 0;
+     std::size_t unlowered = 0;
+     std::size_t fp_runtime_branches = 0;
++    std::size_t fp_mode_copied = 0;  // CTDC-nx: functions given per-mode copies
+     std::size_t unknown_summaries = 0;
+     std::size_t entries_inferred = 0;    // functions whose entry PR/SZ differs from the default
+     std::size_t entries_unknown = 0;     // functions reached in more than one mode (runtime tests)
+diff --git a/translator/src/emit/emit.cpp b/translator/src/emit/emit.cpp
+index 43f0b9b..175aab4 100644
+--- a/translator/src/emit/emit.cpp
++++ b/translator/src/emit/emit.cpp
+@@ -1977,25 +1977,79 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+                     (f.fpscr_entry & ~(1u << 20)) | (static_cast<std::uint32_t>(e.sz) << 20);
+         }
+     }
+-    if (options.parts <= 1) {
+-        for (const auto& f : specs) {
+-            FunctionEmitter fe(image, f, options, known, summaries, result);
+-            fe.set_written(&written);
+-            src << fe.run() << "\n";
++    // CTDC-nx: FP-mode copies. A function entered in a mode the analysis cannot pin down (only
++    // reached through pointers, or from callers that disagree) tests FPSCR.SZ / FPSCR.PR at every
++    // floating-point instruction (Crazy Taxi: 21,600 such tests, its vertex loop among them). When
++    // a body has any of those tests, it is also emitted once per possible entry mode, each copy
++    // with the mode known, and the plain entry picks the copy from FPSCR once. Resumes (resume_pc
++    // != 0) keep the generic body with its runtime tests, so a resume in the middle of a function,
++    // where the mode may have changed since entry, is exactly as before.
++    std::vector<std::string> bodies;
++    std::string clone_decls;
++    bodies.reserve(specs.size());
++    for (const auto& f : specs) {
++        FunctionEmitter fe(image, f, options, known, summaries, result);
++        fe.set_written(&written);
++        std::string body = fe.run();
++        // Only the bits this body actually tests are split on: a body that never tests PR keeps
++        // PR as it was (two copies, not four).
++        const bool split_sz = f.entry_sz_unknown && body.find("if (c.fpscr & FPSCR_SZ) {") != std::string::npos;
++        const bool split_pr = f.entry_pr_unknown && body.find("if (c.fpscr & FPSCR_PR) {") != std::string::npos;
++        if (options.fp_mode_copies && (split_sz || split_pr)) {
++            auto copy_name = [&](unsigned pr, unsigned sz) {
++                return f.name + "__pr" + std::to_string(pr) + "sz" + std::to_string(sz);
++            };
++            const unsigned pr_known = (f.fpscr_entry >> 19) & 1u, sz_known = (f.fpscr_entry >> 20) & 1u;
++            std::string copies;
++            for (unsigned pr = 0; pr < 2; ++pr) {
++                if (!split_pr && pr != pr_known)
++                    continue;
++                for (unsigned sz = 0; sz < 2; ++sz) {
++                    if (!split_sz && sz != sz_known)
++                        continue;
++                    FunctionSpec g = f;
++                    g.name = copy_name(pr, sz);
++                    if (split_pr) g.entry_pr_unknown = false;
++                    if (split_sz) g.entry_sz_unknown = false;
++                    g.fpscr_entry = (f.fpscr_entry & ~((1u << 19) | (1u << 20))) | (pr << 19) | (sz << 20);
++                    EmitResult scratch;  // counted once, under the generic body
++                    FunctionEmitter ge(image, g, options, known, summaries, scratch);
++                    ge.set_written(&written);
++                    copies += ge.run() + "\n";
++                    clone_decls += (options.parts > 1 ? "void " : "static void ") + g.name +
++                                   "__resume(Ctx& c, Memory& m, std::uint32_t resume_pc);\n";
++                    clone_decls += "void " + g.name + "(Ctx& c, Memory& m);\n";
++                }
++            }
++            auto pick = [&](unsigned pr) {
++                const unsigned p = split_pr ? pr : pr_known;
++                if (!split_sz)
++                    return copy_name(p, sz_known) + "__resume(c, m, 0);";
++                return "if (c.fpscr & FPSCR_SZ) " + copy_name(p, 1) + "__resume(c, m, 0); else " +
++                       copy_name(p, 0) + "__resume(c, m, 0);";
++            };
++            const std::string dispatch =
++                split_pr ? "if (c.fpscr & FPSCR_PR) { " + pick(1) + " } else { " + pick(0) + " }"
++                                   : pick(pr_known);
++            const std::string plain = f.name + "__resume(c, m, 0); }\n";
++            const std::size_t at = body.rfind(plain);
++            if (at != std::string::npos) {
++                body.replace(at, plain.size(), dispatch + " }\n");
++                ++result.fp_mode_copied;
++                body += copies;
++            }
+         }
++        bodies.push_back(std::move(body));
++    }
++    src << clone_decls << "\n";
++    if (options.parts <= 1) {
++        for (const auto& b : bodies) src << b << "\n";
+     } else {
+         // Every part starts with the same prelude (includes and every declaration), then takes a
+         // contiguous share of the bodies, balanced by emitted size.
+         const std::string prelude = src.str();
+-        std::vector<std::string> bodies;
+-        bodies.reserve(specs.size());
+         std::size_t total = 0;
+-        for (const auto& f : specs) {
+-            FunctionEmitter fe(image, f, options, known, summaries, result);
+-            fe.set_written(&written);
+-            bodies.push_back(fe.run());
+-            total += bodies.back().size() + 1;
+-        }
++        for (const auto& b : bodies) total += b.size() + 1;
+         const std::size_t share = total / options.parts + 1;
+         std::vector<std::ostringstream> parts(options.parts);
+         for (auto& p : parts) p << prelude;
+diff --git a/translator/src/main.cpp b/translator/src/main.cpp
+index 8cedc09..1a7c05d 100644
+--- a/translator/src/main.cpp
++++ b/translator/src/main.cpp
+@@ -170,6 +170,8 @@ int cmd_emit(int argc, char** argv) {
+             opt.trace = true;
+         else if (!std::strcmp(argv[i], "--no-irq"))
+             opt.irq_checks = false;
++        else if (!std::strcmp(argv[i], "--no-fp-mode-copies"))
++            opt.fp_mode_copies = false;
+         else if (!std::strcmp(argv[i], "--no-local-regs"))
+             opt.local_regs = false;
+         else if (!std::strcmp(argv[i], "--functions") && i + 1 < argc) {
+@@ -432,7 +434,8 @@ int translate_view(const dream::translator::GameConfig& cfg, const dream::transl
+         rep << "unit " << stem << "\nimage base 0x" << std::hex << img.base << " size " << std::dec
+             << img.bytes.size() << " bytes\nfunctions " << fns.size() << " (named " << named
+             << ")\ninstructions " << res.instructions << "\nnot lowered " << res.unlowered
+-            << "\nfp runtime branches " << res.fp_runtime_branches << "\nunknown fpscr summaries "
++            << "\nfp runtime branches " << res.fp_runtime_branches
++            << "\nfp mode copies " << res.fp_mode_copied << "\nunknown fpscr summaries "
+             << res.unknown_summaries << "\nswitch tables " << res.switches_recovered << " of "
+             << r.switches << " discovered\ndirect jsr/bsrf calls " << res.direct_calls
+             << "\npatched pool words (not folded) " << res.patched_words
+@@ -465,6 +468,8 @@ int cmd_game(int argc, char** argv) {
+             opt.trace = true;
+         else if (!std::strcmp(argv[i], "--no-irq"))
+             opt.irq_checks = false;
++        else if (!std::strcmp(argv[i], "--no-fp-mode-copies"))
++            opt.fp_mode_copies = false;
+         else if (!std::strcmp(argv[i], "--no-local-regs"))
+             opt.local_regs = false;
+         else if (!std::strcmp(argv[i], "--parts") && i + 1 < argc)

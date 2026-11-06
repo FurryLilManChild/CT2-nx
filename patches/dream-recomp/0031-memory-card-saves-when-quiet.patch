@@ -1,0 +1,191 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index d8d280e..9ab4183 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -1525,11 +1525,12 @@ std::string report_text(dream::System& sys, dream::hle::Bios& bios, const dream:
+     if (card_ptr) {
+         std::snprintf(buf, sizeof buf,
+                       "memory card: %llu block reads, %llu block writes, %llu media-info reads, "
+-                      "%llu screen writes\n",
++                      "%llu screen writes, %llu file saves\n",
+                       static_cast<unsigned long long>(card_ptr->block_reads),
+                       static_cast<unsigned long long>(card_ptr->block_writes),
+                       static_cast<unsigned long long>(card_ptr->media_info_reads),
+-                      static_cast<unsigned long long>(card_ptr->screen_writes));
++                      static_cast<unsigned long long>(card_ptr->screen_writes),
++                      static_cast<unsigned long long>(card_ptr->saves));
+         s += buf;
+     }
+     {
+@@ -3212,6 +3213,10 @@ int main(int argc, char** argv) {
+                         static_cast<double>(pcm.size() / 2) / 44100.0);
+         }
+     }
++    // ZombieRev-nx: the memory card saves after a quiet stretch (maple.h); a save the player made
++    // just before quitting is written now, before anything else can go wrong.
++    if (card_ptr)
++        card_ptr->flush();
+     // SA-nx (release 0.5.0): --quick-exit leaves out the end-of-run report and the suggested
+     // configuration. Building them (every untranslated call target, every relocation candidate,
+     // the device counters) took about a minute on the Switch after the player quit; a release
+diff --git a/runtime/include/dream/runtime/maple/maple.h b/runtime/include/dream/runtime/maple/maple.h
+index 441f57f..5231f94 100644
+--- a/runtime/include/dream/runtime/maple/maple.h
++++ b/runtime/include/dream/runtime/maple/maple.h
+@@ -73,6 +73,8 @@ public:
+     // fills `out` with the reply payload (a multiple of 4 bytes).
+     virtual Reply handle(std::uint8_t command, const std::uint32_t* args, std::size_t nwords,
+                          Payload& out) = 0;
++    // ZombieRev-nx: called once a frame (Bus::vblank) for every attached device, transfer or not.
++    virtual void vblank() {}
+ };
+ 
+ // A host input's travel, 0 to 1 per direction, as the controller's own byte. The pair is one axis:
+@@ -139,9 +141,20 @@ public:
+     // mistyped argument destroyed whatever it named. Anything that is not exactly kImageSize bytes
+     // is refused, and no path is remembered, so nothing can be written back over it.
+     CardStatus load(const std::string& path);
+-    // Writes the image back; called automatically after each block write when a path is set.
+-    // False when there is no path, which is what a refused load leaves behind.
++    // Writes the image back. False when there is no path, which is what a refused load leaves
++    // behind.
+     bool save() const;
++    // ZombieRev-nx: block writes no longer save at once. Every write used to rewrite the whole
++    // 128 KB file on the game thread; Zombie Revenge writes its card hundreds of times a session
++    // (528 block-phase writes in switch-test1), and those SD writes were 52% of the game thread's
++    // slow stretches on the Switch. Writes now mark the card dirty, and vblank() saves once the
++    // card has had kQuietFrames frames without a write: one file write per save instead of one
++    // per eighth of a block. flush() saves now if anything is pending; the launcher calls it when
++    // the run ends, and the destructor calls it too.
++    static constexpr unsigned kQuietFrames = 30;
++    void vblank() override;
++    void flush();
++    ~MemoryCard() override;
+     // Writes to `path` and adopts it. For creating a card that did not exist yet.
+     bool save_as(const std::string& path);
+ 
+@@ -161,6 +174,10 @@ public:
+ private:
+     std::vector<std::uint8_t> flash_ = std::vector<std::uint8_t>(kImageSize, 0);
+     std::string path_;
++    bool dirty_ = false;          // ZombieRev-nx: written since the last save
++    unsigned quiet_frames_ = 0;   // frames since the last block write
++public:
++    std::uint64_t saves = 0;      // ZombieRev-nx: file writes, for the report
+ };
+ 
+ class Bus final : public mem::MmioHandler {
+diff --git a/runtime/src/maple/maple.cpp b/runtime/src/maple/maple.cpp
+index f4f606f..0424b0d 100644
+--- a/runtime/src/maple/maple.cpp
++++ b/runtime/src/maple/maple.cpp
+@@ -65,6 +65,25 @@ bool MemoryCard::save() const {
+     return static_cast<bool>(out);
+ }
+ 
++void MemoryCard::vblank() {
++    if (!dirty_ || ++quiet_frames_ < kQuietFrames)
++        return;
++    flush();
++}
++
++void MemoryCard::flush() {
++    if (!dirty_)
++        return;
++    if (save()) {
++        dirty_ = false;
++        ++saves;
++    } else {
++        quiet_frames_ = 0;  // try again after another quiet stretch
++    }
++}
++
++MemoryCard::~MemoryCard() { flush(); }
++
+ bool MemoryCard::save_as(const std::string& path) {
+     path_ = path;
+     return save();
+@@ -219,8 +238,12 @@ Reply MemoryCard::handle(std::uint8_t command, const std::uint32_t* args, std::s
+                 return kFileError;
+             std::memcpy(flash_.data() + offset, args + 2, length);
+             ++block_writes;
+-            if (!save())
++            // ZombieRev-nx: saved by vblank() once the card goes quiet (see maple.h). A card with
++            // no path still refuses writes, as save() used to make it.
++            if (path_.empty())
+                 return kFileError;
++            dirty_ = true;
++            quiet_frames_ = 0;
+             return kDeviceReply;
+         }
+         case kGetLastError:
+@@ -320,6 +343,14 @@ Device* Bus::device_for(unsigned port, std::uint8_t recipient) const noexcept {
+ }
+ 
+ void Bus::vblank() {
++    // ZombieRev-nx: per-frame housekeeping for every device (the memory card's deferred save).
++    for (unsigned port = 0; port < kPorts; ++port) {
++        if (ports_[port])
++            ports_[port]->vblank();
++        for (auto& dev : expansion_[port])
++            if (dev)
++                dev->vblank();
++    }
+     if (!(mden & 1))
+         return;
+     if (mdtsel == 1) {  // hardware trigger
+diff --git a/runtime/tests/test_memcard.cpp b/runtime/tests/test_memcard.cpp
+index f5e3923..f58da19 100644
+--- a/runtime/tests/test_memcard.cpp
++++ b/runtime/tests/test_memcard.cpp
+@@ -161,3 +161,50 @@ TEST_CASE("a formatted card survives the round trip through a file") {
+     CHECK(b.formatted());
+     CHECK(b.image() == a.image());
+ }
++
++// ZombieRev-nx: block writes are saved once the card goes quiet, not on every write.
++TEST_CASE("block writes reach the file after a quiet stretch, or at flush") {
++    using dream::maple::Payload;
++    const auto dir = temp_dir();
++    const auto p = dir / "deferred.bin";
++    auto read_file = [&] {
++        std::ifstream in(p, std::ios::binary);
++        return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), {});
++    };
++    // The request word as the bus delivers it (byte-swapped): block 10, phase 1.
++    auto write = [](MemoryCard& c, std::uint8_t value) {
++        std::array<std::uint32_t, 2 + 32> args{};
++        args[0] = dream::maple::kStorage;
++        const std::uint32_t request = (1u << 16) | 10u;
++        args[1] = ((request & 0xFF) << 24) | ((request & 0xFF00) << 8) |
++                  ((request >> 8) & 0xFF00) | (request >> 24);
++        for (std::size_t i = 2; i < args.size(); ++i) args[i] = value * 0x01010101u;
++        Payload out;
++        return c.handle(dream::maple::kBlockWrite, args.data(), args.size(), out);
++    };
++    const std::size_t at = 10 * MemoryCard::kBlockSize + MemoryCard::kBlockSize / 4;
++    {
++        MemoryCard c;
++        c.format();
++        REQUIRE(c.save_as(p.string()));
++        CHECK(write(c, 0xAB) == dream::maple::kDeviceReply);
++        CHECK(c.image()[at] == 0xAB);
++        CHECK(read_file()[at] == 0x00);  // not yet on disk
++        for (unsigned i = 0; i + 1 < MemoryCard::kQuietFrames; ++i) c.vblank();
++        CHECK(read_file()[at] == 0x00);
++        c.vblank();
++        CHECK(read_file()[at] == 0xAB);  // saved after the quiet stretch
++        CHECK(c.saves == 1);
++        for (unsigned i = 0; i < 100; ++i) c.vblank();
++        CHECK(c.saves == 1);  // nothing new, nothing saved
++
++        CHECK(write(c, 0xCD) == dream::maple::kDeviceReply);
++        c.flush();
++        CHECK(read_file()[at] == 0xCD);
++        CHECK(write(c, 0xEF) == dream::maple::kDeviceReply);
++    }
++    CHECK(read_file()[at] == 0xEF);  // the destructor saved the last write
++    MemoryCard none;  // no path: writes are refused, as before
++    none.format();
++    CHECK(write(none, 0x11) == dream::maple::kFileError);
++}

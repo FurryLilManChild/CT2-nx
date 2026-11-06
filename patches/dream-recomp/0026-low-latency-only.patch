@@ -1,0 +1,79 @@
+diff --git a/render/include/dream/render/port_menu.h b/render/include/dream/render/port_menu.h
+index 67fb248..f2ba3ab 100644
+--- a/render/include/dream/render/port_menu.h
++++ b/render/include/dream/render/port_menu.h
+@@ -40,7 +40,9 @@ struct PortOptions {
+     // last finished frame stays up and the game runs on. 1 "low latency": the game waits for the
+     // frame being drawn, as before switch-test24 (no frame of extra delay, slower when the GPU or
+     // the render thread is behind).
+-    int pacing = 0;
++    // CTDC-nx and ZombieRev-nx: always 1. Both are 60 fps games that must show every frame they
++    // draw, so smooth is not offered and an options file cannot turn it back on (Mark, 2026-11-04).
++    int pacing = 1;
+ 
+     std::string to_text() const;
+     static PortOptions from_text(std::string_view text);
+@@ -106,6 +108,8 @@ private:
+     bool visible(int row) const {
+         if (row == kSnapshot)
+             return show_snapshot;
++        if (row == kPacing)
++            return false;  // CTDC-nx: no frame pacing choice (see PortOptions::pacing)
+         return (row != kCpu && row != kGpu && row != kMem) || clock_;
+     }
+ 
+diff --git a/render/src/port_menu.cpp b/render/src/port_menu.cpp
+index f1913fd..35dcd74 100644
+--- a/render/src/port_menu.cpp
++++ b/render/src/port_menu.cpp
+@@ -94,7 +94,7 @@ PortOptions PortOptions::from_text(std::string_view text) {
+         else if (key == "MEM_MHZ" && to_int(value, v))
+             o.mem_mhz = kMemSteps[step_index(kMemSteps, v)];
+         else if (key == "PACING")
+-            o.pacing = value == "latency" ? 1 : 0;
++            o.pacing = 1;  // CTDC-nx: low latency only, whatever the file says
+         else if (key == "SCALE")
+             o.scale = value == "1.5" ? 150 : (value == "2" || value == "3") ? 200 : 100;
+         else if (key == "TRANSLUCENCY")
+@@ -134,8 +134,7 @@ void PortMenu::adjust(int delta) {
+             options_.volume = std::clamp(options_.volume + delta * 10, 0, 100);
+             break;
+         case kPacing:
+-            options_.pacing = options_.pacing == 1 ? 0 : 1;
+-            break;
++            break;  // CTDC-nx: hidden, low latency only
+         case kScale: {
+             static constexpr int kSteps[] = {100, 150, 200};
+             int i = options_.scale == 200 ? 2 : options_.scale == 150 ? 1 : 0;
+@@ -223,7 +222,7 @@ void PortMenu::draw(std::uint32_t* rgba, unsigned pitch, unsigned width, unsigne
+     fill_rect(rgba, pitch, width, height, cx, cy, card_w, banner_h, kUiOrange);
+     const TextStyle banner{kUiWhite, 0, s};
+     draw_text(rgba, pitch, width, height, cx + pad, cy + pad / 2 + static_cast<int>(s),
+-              "SONIC ADVENTURE", banner);
++              "CRAZY TAXI 2", banner);
+ 
+     const int left = cx + pad, right = cx + card_w - pad;
+     int y = cy + banner_h + pad;
+diff --git a/render/tests/test_port_menu.cpp b/render/tests/test_port_menu.cpp
+index 86c3828..b9ced49 100644
+--- a/render/tests/test_port_menu.cpp
++++ b/render/tests/test_port_menu.cpp
+@@ -77,15 +77,11 @@ TEST_CASE("port menu: moving, changing and closing") {
+     CHECK(PortOptions::from_text("SCALE=3\n").scale == 200);  // test15's 3x
+     CHECK(PortOptions::from_text("SCALE=junk\n").scale == 100);
+     CHECK(PortOptions::from_text(m.options().to_text()).scale == 200);
+-    m.move(1);  // FRAME PACING: smooth, low latency
+-    CHECK(m.options().pacing == 0);
+-    CHECK(m.activate() == PortMenu::Action::None);
++    // CTDC-nx: FRAME PACING is hidden and always low latency.
+     CHECK(m.options().pacing == 1);
++    CHECK(PortOptions::from_text("PACING=smooth\n").pacing == 1);
+     CHECK(PortOptions::from_text(m.options().to_text()).pacing == 1);
+-    m.adjust(1);
+-    CHECK(m.options().pacing == 0);
+-    CHECK(PortOptions::from_text("PACING=junk\n").pacing == 0);
+-    m.move(1);  // the clock rows are hidden, so this is QUIT
++    m.move(1);  // the pacing and clock rows are hidden, so this is QUIT
+     CHECK(m.activate() == PortMenu::Action::Quit);
+     CHECK_FALSE(m.is_open());
+ 

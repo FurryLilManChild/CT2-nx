@@ -1,0 +1,70 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 2f4ba84..ee075b8 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -872,6 +872,8 @@ struct Live {
+     // screen but character select, where it read 0. Both must agree, and only outside play. Read
+     // on the game thread (render_post, render) so the render thread never touches guest RAM.
+     bool on_character_select() {
++        if (whole_game_)  // ZombieRev-nx: Sonic Adventure's addresses mean nothing here
++            return false;
+         const std::uint32_t screen = memory_.read32(0x0C760CF0u),
+                             flag = memory_.read32(0x0C4C7714u);
+         if (screen != seen_screen_ || flag != seen_flag_) {
+@@ -911,8 +913,13 @@ struct Live {
+         const std::uint32_t first = memory_.read32(0x0C900000u);
+         // With --play-modules, only those first words count as play (switch-test17: right after
+         // boot the address held leftover text, "KATA", and the logos drew at the in-game size).
++        // ZombieRev-nx: --whole-game treats every screen as play, so the port menu's resolution and
++        // translucency apply everywhere. The module check below reads Sonic Adventure's module
++        // address, which in Zombie Revenge holds 0 throughout, so the resolution never applied
++        // (switch-test3, Mark: "the resolution scaler doesn't do anything").
+         const int in_game =
+-            !play_modules.empty()
++            whole_game_ ? 1
++            : !play_modules.empty()
+                 ? (std::find(play_modules.begin(), play_modules.end(), first) != play_modules.end()
+                        ? 1
+                        : 0)
+@@ -1347,6 +1354,7 @@ struct Live {
+     dream::render::vk::Offscreen* off_ = &base_;
+     bool dynamic_scale = false;
+     std::vector<std::uint32_t> play_modules;  // --play-modules: first words of gameplay modules
++    bool whole_game_ = false;  // ZombieRev-nx: --whole-game, every screen counts as play
+     int target_scale_ = 100;
+     int in_game_ = -1;  // the module at 0x8C900000: 1 gameplay, 0 title, menus or none, -1 unknown
+     dream::render::vk::Presenter presenter;
+@@ -1847,6 +1855,8 @@ void usage(const char* argv0, std::FILE* out) {
+         "  --perf-log             every five seconds, log where the game thread's time went\n"
+         "  --pipeline-cache FILE  keep built GPU pipelines in FILE and build them all at start\n"
+         "  --quick-exit           skip the end-of-run report and suggested configuration\n"
++        "  --whole-game           every screen counts as play: the menu's resolution and\n"
++        "                         translucency apply on menus too (games without SA's modules)\n"
+         "  --idle-skip F:C[,C..]  F is an empty guest function a wait loop calls; called from\n"
+         "                         return address C, jump the clock to the next event\n"
+         "  --aica-thread          run the sound processor on its own thread (default on the Switch;\n"
+@@ -2089,6 +2099,7 @@ int main(int argc, char** argv) {
+     unsigned scale = 1;
+     bool scale_given = false;  // SA-nx: otherwise the port menu's resolution
+     std::string play_modules_arg;  // SA-nx: --play-modules W,W,... (pick_target)
++    bool whole_game = false;       // ZombieRev-nx: --whole-game (pick_target)
+     // --rtc-seed N: a fixed console clock, so two runs of the same build do the same thing and can
+     // be compared. Any non-zero value will do; the number itself only changes the date a title
+     // shows.
+@@ -2213,6 +2224,8 @@ int main(int argc, char** argv) {
+             idle_skip = argv[++i];
+         else if (!std::strcmp(argv[i], "--play-modules") && i + 1 < argc)
+             play_modules_arg = argv[++i];
++        else if (!std::strcmp(argv[i], "--whole-game"))
++            whole_game = true;
+         else if (!std::strcmp(argv[i], "--no-render-thread"))
+             render_thread = false;
+         else if (!std::strcmp(argv[i], "--aica-thread"))
+@@ -2597,6 +2610,7 @@ int main(int argc, char** argv) {
+         // SA-nx: the port menu's resolution applies in play from the first render (pick_target),
+         // unless --scale fixed one size for the whole run.
+         live->dynamic_scale = !scale_given;
++        live->whole_game_ = whole_game;
+         for (std::size_t at = 0; at < play_modules_arg.size();) {
+             const auto comma = play_modules_arg.find(',', at);
+             live->play_modules.push_back(static_cast<std::uint32_t>(

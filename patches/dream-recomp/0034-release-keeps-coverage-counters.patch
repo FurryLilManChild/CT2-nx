@@ -1,0 +1,28 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index ee075b8..1c61fbf 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -3249,6 +3249,23 @@ int main(int argc, char** argv) {
+                                                       cfg.link_address, maple, pad_ptr, card_ptr,
+                                                       aica, g2, sysblock, dmac);
+     std::fputs(text.c_str(), stdout);
++    // ZombieRev-nx: a release still ends its log with the cheap counters that coverage testing
++    // reads (Mark tests releases before publishing them): missing code, bad memory accesses and
++    // the memory card. Only the expensive parts (relocation search, suggested config) stay out.
++    if (quick_exit) {
++        std::printf("stop: %s\n", stop);
++        std::printf("untranslated call targets: %llu\n",
++                    static_cast<unsigned long long>(sys.untranslated.total()));
++        std::fputs(sys.untranslated.format().c_str(), stdout);
++        std::printf("unmapped memory accesses: %llu\n",
++                    static_cast<unsigned long long>(sys.memory.faults().total()));
++        std::fputs(sys.memory.faults().format().c_str(), stdout);
++        if (card_ptr)
++            std::printf("memory card: %llu block reads, %llu block writes, %llu file saves\n",
++                        static_cast<unsigned long long>(card_ptr->block_reads),
++                        static_cast<unsigned long long>(card_ptr->block_writes),
++                        static_cast<unsigned long long>(card_ptr->saves));
++    }
+     if (!quick_exit) {
+         const std::string rel = suggest_relocations(sys, bytes, cfg.link_address, cfg.load_address,
+                                                     ipbin, cfg.relocations);

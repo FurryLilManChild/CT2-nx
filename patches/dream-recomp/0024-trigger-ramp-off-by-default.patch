@@ -1,0 +1,16 @@
+diff --git a/render/include/dream/render/input.h b/render/include/dream/render/input.h
+index e9d1aa2..8fb0358 100644
+--- a/render/include/dream/render/input.h
++++ b/render/include/dream/render/input.h
+@@ -82,7 +82,10 @@ struct Bindings {
+     int deadzone_percent = 20;
+     // Ramp a digital trigger to full over about 150 ms rather than jumping. A keyboard accelerator
+     // is otherwise fully down or fully up, which for a driving game is most of why a pad matters.
+-    bool trigger_ramp = true;
++    // CTDC-nx: off by default (Mark, 2026-11-03). A digital trigger, such as the Switch's ZL and ZR,
++    // is fully down the moment it is pressed. Still a row in the controls menu for anyone who
++    // wants it; analogue triggers are never ramped either way.
++    bool trigger_ramp = false;
+ 
+     static Bindings defaults();
+     std::string to_text() const;

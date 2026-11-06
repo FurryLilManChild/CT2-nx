@@ -1,0 +1,63 @@
+# Crazy Taxi 2, MK-51136 V1.004 (2001-05-02), USA
+# Written by hand from Crazy Taxi's config (CTDC-nx) and ZombieRev-nx's template. Everything here
+# is read off the disc or is the standard Katana layout; nothing from the disc is ever committed.
+
+[game]
+id = "crazytaxi2"
+title = "Crazy Taxi 2"
+region = "USA"
+product = "MK-51136"
+
+[disc]
+image = "../../assets/Crazy Taxi 2 (USA).chd"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Code files besides 1ST_READ.BIN (dcdisc scan, 2026-11-06): 2_DP.BIN (2.8 MB, Ninja, Shinobi and
+# Kamui banners: the bundled Dream Passport web browser for the online features), SG_DPLDR.BIN and
+# MAIGO.BIN (14,856 bytes each, small loaders). None is configured: the browser is out of scope
+# for an offline port, and a boot report shows any of them reached as untranslated calls far from
+# the main program. FCV*.BIN, PPLDC*.BIN and the AFS archives are data.
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+[functions]
+extra = []
+
+# Exception and interrupt stubs the startup copies below the program (VBR = 0x8C00F000 + 0x400,
+# 0x500, 0x800, 0xA00). Crazy Taxi 2 holds Crazy Taxi's four stubs byte for byte, only their
+# literal pointers into the program moved (0x0C16BF58 -> 0x0C1665B0, 0x0C16BC44 -> 0x0C1662A4),
+# so these are CTDC-nx's relocations at the new sources (2026-11-06). Stubs can patch their own
+# literal pool, so every literal is read at run time (no_fold). Never give 0x8C00FA00 extra
+# `entries`: in CTDC-nx that faulted at boot (switch-test3).
+[[relocations]]
+source = 0x0C166274
+size = 0x34
+dest = 0x8C00F400
+no_fold = true
+
+[[relocations]]
+source = 0x0C1661E0
+size = 0x34
+dest = 0x8C00F500
+no_fold = true
+
+[[relocations]]
+source = 0x0C1661E0
+size = 0x34
+dest = 0x8C00F800
+no_fold = true
+
+[[relocations]]
+source = 0x0C166218
+size = 0x58
+dest = 0x8C00FA00
+no_fold = true
+
+# Crazy Taxi also copies startup code to 0x8C004000 and 0x8C004E0C and small routines to
+# 0x8C00EB90..0x8C00F0F4 and 0x8C00F720; Crazy Taxi 2's versions differ, so they come from the
+# first boot test's suggestions.

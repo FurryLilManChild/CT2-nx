@@ -1,0 +1,722 @@
+diff --git a/runtime/include/dream/runtime/sh4/ops.h b/runtime/include/dream/runtime/sh4/ops.h
+index dea9fe1..92dc0e2 100644
+--- a/runtime/include/dream/runtime/sh4/ops.h
++++ b/runtime/include/dream/runtime/sh4/ops.h
+@@ -453,6 +453,56 @@ inline void ftrv(Ctx& c, unsigned n) noexcept {
+     for (unsigned i = 0; i < 4; ++i) c.fr[n + i] = static_cast<float>(r[i]);
+ }
+ 
++// CTDC-nx: the same operations on front-bank registers the emitter keeps in host locals
++// (EmitOptions::fp_locals). Each computes exactly what its Ctx counterpart above does, in the
++// same order, so a body translated either way produces the same bits.
++inline double dr_of(float hi, float lo) noexcept {
++    const std::uint64_t bits = (static_cast<std::uint64_t>(f2u(hi)) << 32) | f2u(lo);
++    double d;
++    std::memcpy(&d, &bits, 8);
++    return d;
++}
++inline void dr_to(float& hi, float& lo, double d) noexcept {
++    std::uint64_t bits;
++    std::memcpy(&bits, &d, 8);
++    hi = u2f(static_cast<std::uint32_t>(bits >> 32));
++    lo = u2f(static_cast<std::uint32_t>(bits));
++}
++inline std::uint64_t pair_of(float hi, float lo) noexcept {
++    return (static_cast<std::uint64_t>(f2u(hi)) << 32) | f2u(lo);
++}
++inline void pair_to(float& hi, float& lo, std::uint64_t v) noexcept {
++    hi = u2f(static_cast<std::uint32_t>(v >> 32));
++    lo = u2f(static_cast<std::uint32_t>(v));
++}
++inline void fsca_to(const Ctx& c, float& s, float& co) noexcept {
++    const detail::SinCos& e = detail::fsca_table()[c.fpul & 0xFFFFu];
++    s = e.s;
++    co = e.c;
++}
++// FIPR with a = FV[n], b = FV[m]: the value for FR[n+3].
++inline float fipr_v(float a0, float a1, float a2, float a3, float b0, float b1, float b2,
++                    float b3) noexcept {
++    double d = static_cast<double>(a0) * b0;
++    d += static_cast<double>(a1) * b1;
++    d += static_cast<double>(a2) * b2;
++    d += static_cast<double>(a3) * b3;
++    return static_cast<float>(d);
++}
++inline void ftrv_to(const Ctx& c, float& v0, float& v1, float& v2, float& v3) noexcept {
++    const float x = v0, y = v1, z = v2, w = v3;
++    const float* xm = c.xf;
++    double r[4];
++    for (unsigned i = 0; i < 4; ++i) {
++        r[i] = static_cast<double>(xm[i]) * x + static_cast<double>(xm[i + 4]) * y +
++               static_cast<double>(xm[i + 8]) * z + static_cast<double>(xm[i + 12]) * w;
++    }
++    v0 = static_cast<float>(r[0]);
++    v1 = static_cast<float>(r[1]);
++    v2 = static_cast<float>(r[2]);
++    v3 = static_cast<float>(r[3]);
++}
++
+ // LDS Rm,FPSCR: store, swap banks if FR changed, and program the host rounding/denormal mode.
+ inline void write_fpscr(Ctx& c, std::uint32_t v) noexcept {
+     v &= 0x003FFFFFu;
+diff --git a/tests/sh4/CMakeLists.txt b/tests/sh4/CMakeLists.txt
+index 51d1d7f..d362e72 100644
+--- a/tests/sh4/CMakeLists.txt
++++ b/tests/sh4/CMakeLists.txt
+@@ -81,53 +81,62 @@ target_include_directories(dream_sh4_runner PRIVATE ${_gen_dir})
+ target_link_libraries(dream_sh4_runner PRIVATE dream::runtime)
+ dream_target_defaults(dream_sh4_runner)
+ 
+-# CTDC-nx: FP-mode copies (translator EmitOptions::fp_mode_copies). The FPU programs are entered
+-# from outside the analysis, so their entry mode is unknown and they get one copy per FPSCR.PR/SZ
+-# mode behind a dispatch. A second runner holds the same programs translated without copies (the
+-# runtime-tested generic body only); the test runs both from every PR/SZ entry mode and requires
+-# identical final state and memory. The in-process tests above only reach the PR=0 SZ=0 copy.
+-set(_nocopy_dir ${CMAKE_CURRENT_BINARY_DIR}/gen_nocopies)
+-file(MAKE_DIRECTORY ${_nocopy_dir})
+-set(_nocopy_sources)
+-set(_nocopy_umbrella "// Generated. Do not edit.\n#pragma once\n")
+-set(_nocopy_table)
+-foreach(prog p5_fpu:fpu p7_fpuedge:fpuedge)
+-  string(REPLACE ":" ";" prog "${prog}")
+-  list(GET prog 0 name)
+-  list(GET prog 1 fn)
+-  foreach(entry IN LISTS DREAM_SH4_PROGRAMS)
+-    string(REPLACE "|" ";" entry "${entry}")
+-    list(GET entry 0 ename)
+-    if(ename STREQUAL name)
+-      list(GET entry 2 base)
+-      list(GET entry 3 specs)
+-    endif()
++# CTDC-nx: differential runners for translator options that must not change results. The FPU
++# programs are entered from outside the analysis, so their entry mode is unknown: by default they
++# get one FP-mode copy per FPSCR.PR/SZ mode behind a dispatch (EmitOptions::fp_mode_copies) and
++# keep FR0..FR15 in host locals (EmitOptions::fp_locals). Each variant runner holds the same
++# programs translated with one option off; the test runs the default runner and every variant
++# from every PR/SZ entry mode and requires identical final state and memory. The in-process tests
++# above only reach the PR=0 SZ=0 path.
++set(_variant_runners)
++function(ctdc_variant_runner suffix flag)
++  set(dir ${CMAKE_CURRENT_BINARY_DIR}/gen_${suffix})
++  file(MAKE_DIRECTORY ${dir})
++  set(sources)
++  set(umbrella "// Generated. Do not edit.\n#pragma once\n")
++  set(table)
++  foreach(prog p5_fpu:fpu p7_fpuedge:fpuedge p15_slotfp:slotfp)
++    string(REPLACE ":" ";" prog "${prog}")
++    list(GET prog 0 name)
++    list(GET prog 1 fn)
++    foreach(entry IN LISTS DREAM_SH4_PROGRAMS)
++      string(REPLACE "|" ";" entry "${entry}")
++      list(GET entry 0 ename)
++      if(ename STREQUAL name)
++        list(GET entry 2 base)
++        list(GET entry 3 specs)
++      endif()
++    endforeach()
++    set(src ${dir}/${name}.cpp)
++    set(hdr ${dir}/${name}.h)
++    add_custom_command(
++      OUTPUT ${src} ${hdr}
++      COMMAND dream-translate emit --image ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
++              --base ${base} --function ${specs} ${flag} --out ${src} --header ${hdr}
++      DEPENDS dream-translate ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
++              ${CMAKE_CURRENT_SOURCE_DIR}/programs/programs.cmake
++      COMMENT "Translating ${name} with ${flag}"
++      VERBATIM)
++    list(APPEND sources ${src})
++    string(APPEND umbrella "#include \"${name}.h\"\n")
++    string(APPEND table "    {\"${name}\", &dream::gen::${fn}},\n")
+   endforeach()
+-  set(src ${_nocopy_dir}/${name}.cpp)
+-  set(hdr ${_nocopy_dir}/${name}.h)
+-  add_custom_command(
+-    OUTPUT ${src} ${hdr}
+-    COMMAND dream-translate emit --image ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
+-            --base ${base} --function ${specs} --no-fp-mode-copies --out ${src} --header ${hdr}
+-    DEPENDS dream-translate ${CMAKE_CURRENT_SOURCE_DIR}/programs/${name}.bin
+-            ${CMAKE_CURRENT_SOURCE_DIR}/programs/programs.cmake
+-    COMMENT "Translating ${name} without FP-mode copies"
+-    VERBATIM)
+-  list(APPEND _nocopy_sources ${src})
+-  string(APPEND _nocopy_umbrella "#include \"${name}.h\"\n")
+-  string(APPEND _nocopy_table "    {\"${name}\", &dream::gen::${fn}},\n")
+-endforeach()
+-string(APPEND _nocopy_umbrella "\nnamespace dream::gen {\nstruct Program {\n    const char* name;\n    void (*entry)(dream::sh4::Ctx&, dream::Memory&);\n};\ninline constexpr Program kPrograms[] = {\n${_nocopy_table}};\n}  // namespace dream::gen\n")
+-file(WRITE ${_nocopy_dir}/emitted_programs.h "${_nocopy_umbrella}")
+-add_executable(dream_sh4_runner_nocopies runner.cpp ${_nocopy_sources})
+-target_include_directories(dream_sh4_runner_nocopies PRIVATE ${_nocopy_dir})
+-target_link_libraries(dream_sh4_runner_nocopies PRIVATE dream::runtime)
+-dream_target_defaults(dream_sh4_runner_nocopies)
++  string(APPEND umbrella "\nnamespace dream::gen {\nstruct Program {\n    const char* name;\n    void (*entry)(dream::sh4::Ctx&, dream::Memory&);\n};\ninline constexpr Program kPrograms[] = {\n${table}};\n}  // namespace dream::gen\n")
++  file(WRITE ${dir}/emitted_programs.h "${umbrella}")
++  add_executable(dream_sh4_runner_${suffix} runner.cpp ${sources})
++  target_include_directories(dream_sh4_runner_${suffix} PRIVATE ${dir})
++  target_link_libraries(dream_sh4_runner_${suffix} PRIVATE dream::runtime)
++  dream_target_defaults(dream_sh4_runner_${suffix})
++endfunction()
++ctdc_variant_runner(nocopies --no-fp-mode-copies)
++ctdc_variant_runner(nofplocals --no-fp-locals)
+ find_package(Python3 COMPONENTS Interpreter)
+ if(Python3_Interpreter_FOUND)
+   add_test(NAME translator.fp_mode_copies
+     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fp_mode_copies.py
+-            --with $<TARGET_FILE:dream_sh4_runner> --without $<TARGET_FILE:dream_sh4_runner_nocopies>
++            --with $<TARGET_FILE:dream_sh4_runner>
++            --without $<TARGET_FILE:dream_sh4_runner_nocopies>
++            --without $<TARGET_FILE:dream_sh4_runner_nofplocals>
+             --programs ${CMAKE_CURRENT_SOURCE_DIR}/programs)
+ endif()
+ 
+diff --git a/tests/sh4/fp_mode_copies.py b/tests/sh4/fp_mode_copies.py
+index a7490d5..2c676ba 100644
+--- a/tests/sh4/fp_mode_copies.py
++++ b/tests/sh4/fp_mode_copies.py
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env python3
+-"""CTDC-nx: differential check of the translator's FP-mode copies.
++"""CTDC-nx: differential check of translator options that must not change results.
+ 
+-Runs each FPU test program in two runners, one translated with FP-mode copies and one without, from
+-every FPSCR.PR/SZ entry mode, and requires the same final context and memory hash from both.
++Runs each FPU test program in the default runner (FP-mode copies and FP registers in locals) and in
++each --without runner (the same programs translated with one of those off), from every FPSCR.PR/SZ
++entry mode, and requires the same final context and memory hash from all of them.
+ """
+ import argparse
+ import os
+@@ -10,16 +11,22 @@ import subprocess
+ import sys
+ import tempfile
+ 
+-PROGRAMS = [("p5_fpu", "p5_fpu.bin", "0x8c010000"), ("p7_fpuedge", "p7_fpuedge.bin", "0x8c010000")]
++# (name, binary, base, extra runner arguments); p15 runs both ways into its delay slot.
++P15 = ["--reg", "r7=0x8c100040", "--freg", "fr0=1.5f", "--freg", "fr1=2.5f", "--freg", "fr2=3.5f",
++       "--freg", "fr3=4.5f"]
++PROGRAMS = [("p5_fpu", "p5_fpu.bin", "0x8c010000", []),
++            ("p7_fpuedge", "p7_fpuedge.bin", "0x8c010000", []),
++            ("p15_slotfp", "p15_slotfp.bin", "0x8c060000", ["--reg", "r5=0"] + P15),
++            ("p15_slotfp", "p15_slotfp.bin", "0x8c060000", ["--reg", "r5=1"] + P15)]
+ # Katana default (DN=1, round toward zero) with each PR/SZ combination.
+ MODES = [0x00040001, 0x000C0001, 0x00140001, 0x001C0001]
+ BUF = "0x8c100000"
+ 
+ 
+-def run(runner, programs_dir, name, binary, base, fpscr, out):
++def run(runner, programs_dir, name, binary, base, extra, fpscr, out):
+     cmd = [runner, "--program", name, "--image", os.path.join(programs_dir, binary), "--base", base,
+            "--fpscr", hex(fpscr), "--reg", "r4=" + BUF, "--reg", "r15=0x8c00f400",
+-           "--hash", BUF + ":0x100", "--out", out]
++           "--hash", BUF + ":0x100", "--out", out] + extra
+     rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+     body = open(out).read() if rc.returncode == 0 and os.path.exists(out) else ""
+     return rc.returncode, body
+@@ -28,20 +35,22 @@ def run(runner, programs_dir, name, binary, base, fpscr, out):
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--with", dest="with_", required=True)
+-    ap.add_argument("--without", required=True)
++    ap.add_argument("--without", action="append", required=True)
+     ap.add_argument("--programs", required=True)
+     a = ap.parse_args()
+     failures = 0
+     with tempfile.TemporaryDirectory() as tmp:
+-        for name, binary, base in PROGRAMS:
++        for name, binary, base, extra in PROGRAMS:
+             for fpscr in MODES:
+-                r1 = run(a.with_, a.programs, name, binary, base, fpscr, os.path.join(tmp, "a.json"))
+-                r2 = run(a.without, a.programs, name, binary, base, fpscr, os.path.join(tmp, "b.json"))
+-                ok = r1 == r2 and r1[0] == 0
+-                print(f"{name} fpscr={fpscr:#010x}: {'same' if ok else 'DIFFERENT'} (rc {r1[0]}/{r2[0]})")
+-                if not ok:
+-                    failures += 1
+-                    print("with copies:\n" + r1[1] + "\nwithout:\n" + r2[1])
++                r1 = run(a.with_, a.programs, name, binary, base, extra, fpscr, os.path.join(tmp, "a.json"))
++                for other in a.without:
++                    r2 = run(other, a.programs, name, binary, base, extra, fpscr, os.path.join(tmp, "b.json"))
++                    ok = r1 == r2 and r1[0] == 0
++                    print(f"{name} {' '.join(extra[:2])} fpscr={fpscr:#010x} vs {os.path.basename(other)}: "
++                          f"{'same' if ok else 'DIFFERENT'} (rc {r1[0]}/{r2[0]})")
++                    if not ok:
++                        failures += 1
++                        print("default:\n" + r1[1] + "\nvariant:\n" + r2[1])
+     return 1 if failures else 0
+ 
+ 
+diff --git a/tests/sh4/programs/p15_slotfp.bin b/tests/sh4/programs/p15_slotfp.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba31d695cac2b933c49304edf715a7ee03aa49b1
+GIT binary patch
+literal 24
+dcma!0W$ga@nR$WMcdjqo44e#7U;cgu(ExcF2;u+$
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/sh4/programs/p15_slotfp.s b/tests/sh4/programs/p15_slotfp.s
+new file mode 100644
+index 0000000..22be0bb
+--- /dev/null
++++ b/tests/sh4/programs/p15_slotfp.s
+@@ -0,0 +1,24 @@
++! CTDC-nx: a conditional branch into another branch's delay slot, with the floating-point size
++! mode differing between the two ways into the slot (Crazy Taxi's vertex loop, fn_0c081200).
++! Entered from outside (mode unknown), so the translator makes FP-mode copies of it.
++! r5 != 0: bf is taken into the slot; the slot and the block after it run in the entry mode.
++! r5 == 0: fschg toggles SZ, the bra's slot runs in the toggled mode, and the target restores it.
++! r4 and r7 point at scratch memory; fr0..fr3 hold values whose stored size shows the mode.
++! Hand-assembled (no SH assembler in the CTDC-nx build workspace); words in p15_slotfp.bin.
++    .text
++    .global _slotfp
++_slotfp:
++    tst     r5,r5           ! 0x2558
++    bf      slot            ! 0x8b01
++    fschg                   ! 0xf3fd
++    bra     tail            ! 0xa003
++slot:
++    fmov    fr2,@r7         ! 0xf72a (delay slot of the bra, also the bf target)
++    fmov    fr0,@r4         ! 0xf40a
++    rts                     ! 0x000b
++    nop                     ! 0x0009
++tail:
++    fmov    fr1,@r4         ! 0xf41a
++    fschg                   ! 0xf3fd
++    rts                     ! 0x000b
++    nop                     ! 0x0009
+diff --git a/tests/sh4/programs/programs.cmake b/tests/sh4/programs/programs.cmake
+index c1c99f7..15746cb 100644
+--- a/tests/sh4/programs/programs.cmake
++++ b/tests/sh4/programs/programs.cmake
+@@ -20,6 +20,8 @@ set(DREAM_SH4_PROGRAMS
+   "p13_tailpr|p13_tailpr.bin|0x8c040000|0x8c040000:0x8c04000a:tailpr_main 0x8c04000a:0x8c04000e:tailpr_inner 0x8c04000e:0x8c040014:tailpr_tail 0x8c040014:0x8c040020:tailpr_main2 0x8c040024:0x8c040032:tailpr_main3 0x8c040034:0x8c04003e:tailpr_jret"
+   # Own base: a bank switch inside a function (SA-nx, registers in host locals).
+   "p14_bank|p14_bank.bin|0x8c050000|0x8c050000:0x8c050024:bank"
++  # Own base (CTDC-nx): a branch into another branch's delay slot under two FP size modes.
++  "p15_slotfp|p15_slotfp.bin|0x8c060000|0x8c060000:0x8c060018:slotfp"
+   # GCC-compiled C unit (tests/sh4/cprogs, `make specs` prints this line)
+   "c1_idioms|../cprogs/c1_idioms.bin|0x8c010000|0x8c010000:0x8c010024:div_mod 0x8c010028:0x8c010072:udiv_mix 0x8c010080:0x8c0100e4:dense_switch 0x8c0100e8:0x8c010100:mul64 0x8c010100:0x8c010132:sub64 0x8c010134:0x8c010178:pack_bytes 0x8c010180:0x8c0101d6:vec_transform 0x8c0101d8:0x8c010222:sort_words 0x8c010224:0x8c010246:dot3 0x8c010248:0x8c01026a:clamp_scale 0x8c010270:0x8c01027c:float_to_fixed 0x8c010280:0x8c010526:fib 0x8c01052c:0x8c010552:str_len 0x8c010554:0x8c010574:mem_copy 0x8c010578:0x8c0106b8:udivsi3_i4i 0x8c01059e:0x8c0105d4:udivsi3_i4i_059e 0x8c0105cc:0x8c0105d4:udivsi3_i4i_05cc 0x8c0105d4:0x8c010648:udivsi3_i4i_05d4 0x8c010648:0x8c010796:sdivsi3_i4i 0x8c010674:0x8c0106b8:sdivsi3_i4i_0674 0x8c01069a:0x8c0106b8:sdivsi3_i4i_069a"
+ )
+diff --git a/translator/include/dream/translator/emit.h b/translator/include/dream/translator/emit.h
+index c932b96..a627870 100644
+--- a/translator/include/dream/translator/emit.h
++++ b/translator/include/dream/translator/emit.h
+@@ -54,6 +54,10 @@ struct EmitOptions {
+     // CTDC-nx: bodies that test FPSCR at run time are also emitted once per entry mode, picked
+     // at the plain entry (emit_unit). --no-fp-mode-copies turns it off.
+     bool fp_mode_copies = true;
++    // CTDC-nx: the front floating-point bank (FR0..FR15) in host locals as well, with the same
++    // write-back points as the general registers plus FRCHG and FPSCR loads (which may swap the
++    // banks). Needs local_regs. --no-fp-locals turns it off.
++    bool fp_locals = true;
+     bool overlay = false;    // table entries carry the code words they were translated from
+     // Split the unit's function bodies over this many translation units (SA-nx). A 6.7 MB binary
+     // emits about 160 MB of C++, which no compiler handles well as one file. Part 0 also holds the
+@@ -76,6 +80,7 @@ struct EmitResult {
+     std::size_t unlowered = 0;
+     std::size_t fp_runtime_branches = 0;
+     std::size_t fp_mode_copied = 0;  // CTDC-nx: functions given per-mode copies
++    std::size_t fp_locals_bodies = 0;  // CTDC-nx: bodies (copies included) with FR in locals
+     std::size_t unknown_summaries = 0;
+     std::size_t entries_inferred = 0;    // functions whose entry PR/SZ differs from the default
+     std::size_t entries_unknown = 0;     // functions reached in more than one mode (runtime tests)
+diff --git a/translator/src/emit/emit.cpp b/translator/src/emit/emit.cpp
+index 175aab4..381a7d7 100644
+--- a/translator/src/emit/emit.cpp
++++ b/translator/src/emit/emit.cpp
+@@ -1,6 +1,8 @@
+ #include "dream/translator/emit.h"
+ 
+ #include <algorithm>
++#include <bit>
++#include <cctype>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <map>
+@@ -48,8 +50,10 @@ std::string label(std::uint32_t a) {
+ struct LocalRegs {
+     bool on = false;
+     std::uint32_t used = 0;
++    bool fp = false;  // CTDC-nx: FR0..FR15 in locals too (EmitOptions::fp_locals)
+ };
+ LocalRegs g_local;
++std::size_t g_fp_locals_bodies = 0;  // CTDC-nx: bodies that kept FR0..FR15 in locals (report)
+ const std::string kSpill = "\x01S\x01";
+ const std::string kLoad = "\x01L\x01";
+ const std::string kDecl = "\x01Q\x01";  // not D: \x01D would read as one hex escape
+@@ -59,6 +63,22 @@ std::string SP() {
+ std::string LD() {
+     return g_local.on ? kLoad : std::string();
+ }
++// CTDC-nx: FP-only write-back and reload, around the operations that read or swap the context's
++// banks but are not calls (FRCHG, an FPSCR load). Letters, not hex digits, after \x01.
++const std::string kFpSpill = "\x01P\x01";
++const std::string kFpLoad = "\x01K\x01";
++std::string FSP() {
++    return g_local.on && g_local.fp ? kFpSpill : std::string();
++}
++std::string FLD() {
++    return g_local.on && g_local.fp ? kFpLoad : std::string();
++}
++bool fp_local() {
++    return g_local.on && g_local.fp;
++}
++std::string FR(unsigned n) {
++    return fp_local() ? "fpr" + std::to_string(n) : "c.fr[" + std::to_string(n) + "]";
++}
+ // Replaces the markers in a finished body with the registers it names. The set comes from the
+ // text itself, not from every R() call, because some lowerings name operands they do not use.
+ // Replaces every occurrence of `from` in `s` with `to`.
+@@ -124,12 +144,77 @@ std::string localise(const std::string& body_in) {
+         }
+     if (!gprs.empty())
+         decl += gprs + ";\n";
++    // CTDC-nx: front-bank FP registers the body names as locals (fpr0..fpr15).
++    std::uint32_t fused = 0;
++    for (std::size_t i = body.find("fpr"); i != std::string::npos; i = body.find("fpr", i + 3)) {
++        std::size_t j = i + 3;
++        unsigned n = 0;
++        while (j < body.size() && body[j] >= '0' && body[j] <= '9') n = n * 10 + (body[j++] - '0');
++        const bool word_start = i == 0 || !(std::isalnum(static_cast<unsigned char>(body[i - 1])) || body[i - 1] == '_');
++        if (j > i + 3 && n < 16 && word_start)
++            fused |= 1u << n;
++    }
++    // Keeping them in locals saves a context access per use but costs a write-back and a reload
++    // of every one of them at each call and return. Where that costs more than it saves (few FP
++    // operations, many calls) the body goes back to naming the context; the helpers take either.
++    // Interrupt polls are not counted: they only spill when an interrupt is due.
++    if (fused) {
++        std::size_t refs = 0, syncs = 0;
++        for (std::size_t i = body.find("fpr"); i != std::string::npos; i = body.find("fpr", i + 3)) ++refs;
++        for (const std::string& mk : {kSpill, kLoad, kFpSpill, kFpLoad}) {
++            for (std::size_t i = body.find(mk); i != std::string::npos; i = body.find(mk, i + 3)) {
++                const bool poll = body.compare(i + 3, 12, "deliver_irq(") == 0 ||
++                                  (i >= 19 && body.compare(i - 19, 19, "deliver_irq(c, m); ") == 0);
++                if (!poll)
++                    ++syncs;
++            }
++        }
++        const std::size_t regs = static_cast<std::size_t>(std::popcount(fused));
++        if (refs < (syncs + 2) * regs) {
++            std::string back;
++            back.reserve(body.size() + body.size() / 8);
++            for (std::size_t i = 0; i < body.size();) {
++                std::size_t j = i + 3;
++                unsigned n = 0;
++                if (body.compare(i, 3, "fpr") == 0 &&
++                    (i == 0 || !(std::isalnum(static_cast<unsigned char>(body[i - 1])) || body[i - 1] == '_'))) {
++                    while (j < body.size() && body[j] >= '0' && body[j] <= '9') n = n * 10 + (body[j++] - '0');
++                    if (j > i + 3 && n < 16) {
++                        back += "c.fr[" + std::to_string(n) + "]";
++                        i = j;
++                        continue;
++                    }
++                }
++                back += body[i++];
++            }
++            body.swap(back);
++            fused = 0;
++        } else {
++            g_fp_locals_bodies += 1;
++        }
++    }
++    std::string fprs, fspill, fload;
++    for (unsigned n = 0; n < 16; ++n)
++        if (fused & (1u << n)) {
++            const std::string k = std::to_string(n);
++            fprs += (fprs.empty() ? "    float " : ", ") + std::string("fpr") + k + " = c.fr[" + k + "]";
++            fspill += "c.fr[" + k + "] = fpr" + k + "; ";
++            fload += " fpr" + k + " = c.fr[" + k + "];";
++        }
++    if (!fprs.empty())
++        decl += fprs + ";\n";
++    spill += fspill;
++    load += fload;
+     std::string out = head;
+     out.reserve(head.size() + body.size() + body.size() / 4);
+     for (std::size_t i = 0; i < body.size();) {
+         if (body[i] == '\x01' && i + 2 < body.size() && body[i + 2] == '\x01') {
+             const char k = body[i + 1];
+-            out += k == 'S' ? spill : k == 'L' ? load : decl;
++            out += k == 'S'   ? spill
++                   : k == 'L' ? load
++                   : k == 'P' ? fspill
++                   : k == 'K' ? fload
++                              : decl;
+             i += 3;
+         } else {
+             out += body[i++];
+@@ -367,7 +452,7 @@ public:
+         if (opt_.irq_checks)
+             out << "    if (c.cycles >= c.next_event) { c.pc = resume_pc ? resume_pc : "
+                 << hexu(spec_.entry) << "; deliver_irq(c, m); }\n";
+-        g_local = LocalRegs{opt_.local_regs, 0};
++        g_local = LocalRegs{opt_.local_regs, 0, opt_.local_regs && opt_.fp_locals};
+         out << kDecl;
+         out << "    if (resume_pc) {\n        switch (resume_pc) {\n";
+         for (std::uint32_t b : blocks_)
+@@ -813,6 +898,29 @@ private:
+             out.push_back(*std::prev(it));
+     }
+ 
++    // CTDC-nx: the target of the conditional branch ending `start` when that target is another
++    // branch's delay slot that is not a block itself and is followed by a block (the `_skip`
++    // entry path); 0 otherwise.
++    std::uint32_t slot_entry_target(std::uint32_t start) const {
++        if (!ends_in_transfer_.at(start))
++            return 0;
++        const std::uint32_t stop = block_end_.at(start);
++        std::uint32_t last = stop - 2;
++        Instr li = at(last);
++        if (!sh4::is_control_flow(li.op) && last >= start + 2) {
++            last -= 2;
++            li = at(last);
++        }
++        if (li.op != Op::BT && li.op != Op::BF && li.op != Op::BT_S && li.op != Op::BF_S)
++            return 0;
++        const std::uint32_t t = sh4::pcrel_target(li, last);
++        if (!in_range(t) || blocks_.count(t) || !slot_labels_.count(t) || !blocks_.count(t + 2))
++            return 0;
++        if (blocks_.upper_bound(t) == blocks_.begin())
++            return 0;
++        return t;
++    }
++
+     std::vector<std::uint32_t> successors(std::uint32_t start) const {
+         std::vector<std::uint32_t> out;
+         const std::uint32_t stop = block_end_.at(start);
+@@ -863,6 +971,7 @@ private:
+             }
+         }
+         for (std::uint32_t b : blocks_) block_mode_[b] = {kUnknown, kUnknown};
++        slot_entry_mode_.clear();
+         block_mode_[spec_.entry] = entry_mode(relative);
+         std::vector<std::uint32_t> work{spec_.entry};
+         std::set<std::uint32_t> reached{spec_.entry};
+@@ -917,12 +1026,27 @@ private:
+                     have_exit = true;
+                 }
+             }
+-            for (std::uint32_t succ : successors(b)) {
+-                const FpMode merged = reached.count(succ) ? merge(block_mode_[succ], m) : m;
++            // CTDC-nx: a branch into another branch's delay slot (emitted as the `_skip` copy)
++            // runs the slot instruction and continues at the instruction after it, the next
++            // block. successors() maps such a target to the block containing the slot, so no
++            // edge reached that next block and it, with everything only reachable through it,
++            // kept an unknown mode: all of Crazy Taxi's vertex loop (fn_0c081200, entered by the
++            // `bf` at 0x0c081204 into the slot of the `bra` at 0x0c081206).
++            std::vector<std::pair<std::uint32_t, FpMode>> edges;
++            for (std::uint32_t succ : successors(b)) edges.push_back({succ, m});
++            if (const std::uint32_t t = slot_entry_target(b); t) {
++                auto owner = blocks_.upper_bound(t);
++                --owner;  // t lies inside a block: slot_entry_target checked it
++                auto se = slot_entry_mode_.find(t);
++                slot_entry_mode_[t] = se == slot_entry_mode_.end() ? m : merge(se->second, m);
++                edges.push_back({t + 2, transfer(slot_entry_mode_[t], *owner, t, at(t))});
++            }
++            for (const auto& [succ, in] : edges) {
++                const FpMode merged = reached.count(succ) ? merge(block_mode_[succ], in) : in;
+                 if (std::getenv("DREAM_EMIT_DEBUG")) {
+                     std::fprintf(
+                         stderr, "fp-edge %s -> %s : exit(pr=%u sz=%u) merged(pr=%u sz=%u)\n",
+-                        hex(b).c_str(), hex(succ).c_str(), m.pr, m.sz, merged.pr, merged.sz);
++                        hex(b).c_str(), hex(succ).c_str(), in.pr, in.sz, merged.pr, merged.sz);
+                 }
+                 if (!reached.count(succ) || merged != block_mode_[succ]) {
+                     block_mode_[succ] = merged;
+@@ -1204,7 +1328,19 @@ private:
+             // branch skips this copy.
+             out << "    goto " << label(pc) << "_skip;\n";
+             out << label(pc + 2) << ":\n";
+-            out << "    " << slot_code << "\n";
++            // CTDC-nx: this copy runs in the mode of the branches that enter the slot, not the
++            // owning branch's (unknown when the dataflow never reached it).
++            const bool slot_illegal =
++                sh4::has_delay_slot(at(pc + 2).op) || at(pc + 2).op == Op::BT || at(pc + 2).op == Op::BF;
++            if (slot_illegal) {
++                out << "    " << slot_code << "\n";
++            } else {
++                const FpMode saved = mode_;
++                auto se = slot_entry_mode_.find(pc + 2);
++                mode_ = se == slot_entry_mode_.end() ? FpMode{kUnknown, kUnknown} : se->second;
++                out << "    " << lower(pc + 2, at(pc + 2)) << "\n";
++                mode_ = saved;
++            }
+             out << label(pc) << "_skip:;\n";
+         }
+         if (call_returns_.count(pc + 4) && !blocks_.count(pc + 4))
+@@ -1304,12 +1440,28 @@ private:
+     std::string lower_fp_mode(const Instr& ins, unsigned pr, unsigned sz) {
+         const unsigned n = ins.n, m = ins.m;
+         const std::string rn = R(n), rm = R(m), r0 = R(0);
+-        const std::string frn = "c.fr[" + std::to_string(n) + "]",
+-                          frm = "c.fr[" + std::to_string(m) + "]";
+-        const std::string drn = "get_dr(c, " + std::to_string(n & ~1u) + ")";
+-        const std::string drm = "get_dr(c, " + std::to_string(m & ~1u) + ")";
++        const bool fl = fp_local();
++        const std::string frn = FR(n), frm = FR(m);
++        const unsigned dn = n & ~1u, dm = m & ~1u;
++        const std::string drn = fl ? "dr_of(" + FR(dn) + ", " + FR(dn + 1) + ")"
++                                   : "get_dr(c, " + std::to_string(dn) + ")";
++        const std::string drm = fl ? "dr_of(" + FR(dm) + ", " + FR(dm + 1) + ")"
++                                   : "get_dr(c, " + std::to_string(dm) + ")";
+         auto set_drn = [&](const std::string& v) {
+-            return "set_dr(c, " + std::to_string(n & ~1u) + ", " + v + ");";
++            return fl ? "dr_to(" + FR(dn) + ", " + FR(dn + 1) + ", " + v + ");"
++                      : "set_dr(c, " + std::to_string(dn) + ", " + v + ");";
++        };
++        // Pair moves (SZ = 1): an even field is DRn in the front bank (locals), an odd one XDn in
++        // the back bank, which stays in the context.
++        auto pair_load = [&](unsigned field, const std::string& v) {
++            if (fl && !(field & 1u))
++                return "pair_to(" + FR(field) + ", " + FR(field + 1) + ", " + v + ");";
++            return "fmov_pair_load(c, " + std::to_string(field) + ", " + v + ");";
++        };
++        auto pair_store = [&](unsigned field) {
++            if (fl && !(field & 1u))
++                return "pair_of(" + FR(field) + ", " + FR(field + 1) + ")";
++            return "fmov_pair_store(c, " + std::to_string(field) + ")";
+         };
+         switch (ins.op) {
+             case Op::FLDI0:
+@@ -1337,7 +1489,7 @@ private:
+             case Op::FCMP_GT:
+                 return "c.t = " + (pr ? drn + " > " + drm : frn + " > " + frm) + ";";
+             case Op::FMAC:
+-                return frn + " = fmac(c.fr[0], " + frm + ", " + frn + ");";
++                return frn + " = fmac(" + FR(0) + ", " + frm + ", " + frn + ");";
+             case Op::FLOAT:
+                 return pr ? set_drn("static_cast<double>(static_cast<std::int32_t>(c.fpul))")
+                           : frn + " = static_cast<float>(static_cast<std::int32_t>(c.fpul));";
+@@ -1352,38 +1504,40 @@ private:
+             case Op::FCNVDS:
+                 return "c.fpul = f2u(static_cast<float>(" + drn + "));";
+             case Op::FSCA:
++                if (fl)
++                    return "fsca_to(c, " + FR(dn) + ", " + FR(dn + 1) + ");";
+                 return "fsca(c, " + std::to_string(n & ~1u) + ");";
+             case Op::FIPR:
++                // The decoder gives the vector registers' first FR index in m and n.
++                if (fl)
++                    return FR(n + 3) + " = fipr_v(" + FR(n) + ", " + FR(n + 1) + ", " + FR(n + 2) +
++                           ", " + FR(n + 3) + ", " + FR(m) + ", " + FR(m + 1) + ", " +
++                           FR(m + 2) + ", " + FR(m + 3) + ");";
+                 return "fipr(c, " + std::to_string(m) + ", " + std::to_string(n) + ");";
+             case Op::FTRV:
++                if (fl)
++                    return "ftrv_to(c, " + FR(n) + ", " + FR(n + 1) + ", " + FR(n + 2) + ", " +
++                           FR(n + 3) + ");";
+                 return "ftrv(c, " + std::to_string(n) + ");";
+             case Op::FMOV:
+-                return sz ? "fmov_pair_load(c, " + std::to_string(n) + ", fmov_pair_store(c, " +
+-                                std::to_string(m) + "));"
+-                          : frn + " = " + frm + ";";
++                return sz ? pair_load(n, pair_store(m)) : frn + " = " + frm + ";";
+             case Op::FMOV_LOAD:
+-                return sz ? "fmov_pair_load(c, " + std::to_string(n) + ", read_pair(m, " + rm +
+-                                "));"
++                return sz ? pair_load(n, "read_pair(m, " + rm + ")")
+                           : frn + " = u2f(m.read32(" + rm + "));";
+             case Op::FMOV_LOAD_INC:
+-                return sz ? "fmov_pair_load(c, " + std::to_string(n) + ", read_pair(m, " + rm +
+-                                ")); " + rm + " += 8;"
++                return sz ? pair_load(n, "read_pair(m, " + rm + ")") + " " + rm + " += 8;"
+                           : frn + " = u2f(m.read32(" + rm + ")); " + rm + " += 4;";
+             case Op::FMOV_LOAD_R0:
+-                return sz ? "fmov_pair_load(c, " + std::to_string(n) + ", read_pair(m, " + rm +
+-                                " + " + r0 + "));"
++                return sz ? pair_load(n, "read_pair(m, " + rm + " + " + r0 + ")")
+                           : frn + " = u2f(m.read32(" + rm + " + " + r0 + "));";
+             case Op::FMOV_STORE:
+-                return sz ? "write_pair(m, " + rn + ", fmov_pair_store(c, " + std::to_string(m) +
+-                                "));"
++                return sz ? "write_pair(m, " + rn + ", " + pair_store(m) + ");"
+                           : "m.write32(" + rn + ", f2u(" + frm + "));";
+             case Op::FMOV_STORE_DEC:
+-                return sz ? rn + " -= 8; write_pair(m, " + rn + ", fmov_pair_store(c, " +
+-                                std::to_string(m) + "));"
++                return sz ? rn + " -= 8; write_pair(m, " + rn + ", " + pair_store(m) + ");"
+                           : rn + " -= 4; m.write32(" + rn + ", f2u(" + frm + "));";
+             case Op::FMOV_STORE_R0:
+-                return sz ? "write_pair(m, " + rn + " + " + r0 + ", fmov_pair_store(c, " +
+-                                std::to_string(m) + "));"
++                return sz ? "write_pair(m, " + rn + " + " + r0 + ", " + pair_store(m) + ");"
+                           : "m.write32(" + rn + " + " + r0 + ", f2u(" + frm + "));";
+             default:
+                 return SP() + "unimplemented(c, " + hexu(ins.raw) + ", 0u);";
+@@ -1741,7 +1895,7 @@ private:
+             case Op::OCBWB:
+                 return "/* cache op: no-op on the host */";
+             case Op::FRCHG:
+-                return "frchg(c);";
++                return FSP() + "frchg(c);" + FLD();
+             case Op::FSCHG:
+                 return "c.fpscr ^= FPSCR_SZ;";
+             case Op::LDS_FPUL:
+@@ -1757,9 +1911,9 @@ private:
+             case Op::STS_L_FPSCR:
+                 return rn + " -= 4; m.write32(" + rn + ", c.fpscr);";
+             case Op::LDS_FPSCR:
+-                return "write_fpscr(c, " + rm + ");";
++                return FSP() + "write_fpscr(c, " + rm + ");" + FLD();
+             case Op::LDS_L_FPSCR:
+-                return "write_fpscr(c, m.read32(" + rm + ")); " + rm + " += 4;";
++                return FSP() + "write_fpscr(c, m.read32(" + rm + "));" + FLD() + " " + rm + " += 4;";
+             case Op::FLDI0:
+             case Op::FLDI1:
+             case Op::FLDS:
+@@ -1813,6 +1967,7 @@ private:
+     std::map<std::uint32_t, bool> ends_in_transfer_;
+     std::map<std::uint32_t, FpMode> block_mode_;
+     std::set<std::uint32_t> slot_labels_;
++    std::map<std::uint32_t, FpMode> slot_entry_mode_;  // CTDC-nx: mode on entry through a slot
+     std::map<std::uint32_t, SwitchTable> switches_;
+     FpMode mode_;
+     unsigned pending_cycles_ = 0;
+@@ -1984,6 +2139,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+     // with the mode known, and the plain entry picks the copy from FPSCR once. Resumes (resume_pc
+     // != 0) keep the generic body with its runtime tests, so a resume in the middle of a function,
+     // where the mode may have changed since entry, is exactly as before.
++    g_fp_locals_bodies = 0;
+     std::vector<std::string> bodies;
+     std::string clone_decls;
+     bodies.reserve(specs.size());
+@@ -2041,6 +2197,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+         }
+         bodies.push_back(std::move(body));
+     }
++    result.fp_locals_bodies = g_fp_locals_bodies;
+     src << clone_decls << "\n";
+     if (options.parts <= 1) {
+         for (const auto& b : bodies) src << b << "\n";
+diff --git a/translator/src/main.cpp b/translator/src/main.cpp
+index 1a7c05d..9640926 100644
+--- a/translator/src/main.cpp
++++ b/translator/src/main.cpp
+@@ -172,6 +172,8 @@ int cmd_emit(int argc, char** argv) {
+             opt.irq_checks = false;
+         else if (!std::strcmp(argv[i], "--no-fp-mode-copies"))
+             opt.fp_mode_copies = false;
++        else if (!std::strcmp(argv[i], "--no-fp-locals"))
++            opt.fp_locals = false;
+         else if (!std::strcmp(argv[i], "--no-local-regs"))
+             opt.local_regs = false;
+         else if (!std::strcmp(argv[i], "--functions") && i + 1 < argc) {
+@@ -435,7 +437,8 @@ int translate_view(const dream::translator::GameConfig& cfg, const dream::transl
+             << img.bytes.size() << " bytes\nfunctions " << fns.size() << " (named " << named
+             << ")\ninstructions " << res.instructions << "\nnot lowered " << res.unlowered
+             << "\nfp runtime branches " << res.fp_runtime_branches
+-            << "\nfp mode copies " << res.fp_mode_copied << "\nunknown fpscr summaries "
++            << "\nfp mode copies " << res.fp_mode_copied << "\nfp locals bodies "
++            << res.fp_locals_bodies << "\nunknown fpscr summaries "
+             << res.unknown_summaries << "\nswitch tables " << res.switches_recovered << " of "
+             << r.switches << " discovered\ndirect jsr/bsrf calls " << res.direct_calls
+             << "\npatched pool words (not folded) " << res.patched_words
+@@ -470,6 +473,8 @@ int cmd_game(int argc, char** argv) {
+             opt.irq_checks = false;
+         else if (!std::strcmp(argv[i], "--no-fp-mode-copies"))
+             opt.fp_mode_copies = false;
++        else if (!std::strcmp(argv[i], "--no-fp-locals"))
++            opt.fp_locals = false;
+         else if (!std::strcmp(argv[i], "--no-local-regs"))
+             opt.local_regs = false;
+         else if (!std::strcmp(argv[i], "--parts") && i + 1 < argc)

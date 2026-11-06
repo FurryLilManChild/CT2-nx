@@ -1,0 +1,27 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 9ab4183..2f4ba84 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -37,6 +37,11 @@ volatile int dream_port_phase = 0;
+ // SA-nx: 1 while the last half second of play ran below 0.95x, so a profiler can keep the slow
+ // stretches apart from the full-speed ones.
+ volatile int dream_port_slow = 0;
++// ZombieRev-nx: the real CPU, GPU and memory clocks in MHz, kept current by the Switch layer
++// (switch_main.cpp's clock_watch, every half second, whoever set them). 0 where unknown (PC).
++volatile int dream_port_cpu_mhz = 0;
++volatile int dream_port_gpu_mhz = 0;
++volatile int dream_port_mem_mhz = 0;
+ // SA-nx: 1 while the last half second showed movie frames (the YUV converter was fed).
+ volatile int dream_port_movie = 0;
+ // SA-nx: called first thing on each helper thread the launcher starts ("aica"), so a platform can
+@@ -466,6 +471,10 @@ struct Live {
+                         static_cast<double>(rendered - perf_rendered_at) / wall, speed,
+                         pct(game_ms), pct(audio_ms), pct(render_ms), pct(present_ms), pct(gpu_ms),
+                         pct(sleep_ms), pct(paused_ms));
++        // ZombieRev-nx: the clocks every perf line ran at, so each reading is tied to one.
++        if (dream_port_cpu_mhz)
++            std::printf("clock: CPU %d MHz, GPU %d MHz, memory %d MHz\n", dream_port_cpu_mhz,
++                        dream_port_gpu_mhz, dream_port_mem_mhz);
+         // SA-nx: the GPU's own time per render, from timestamps, and what translucency cost.
+         const auto& g = off_->gpu;
+         const auto& st = off_->stats;

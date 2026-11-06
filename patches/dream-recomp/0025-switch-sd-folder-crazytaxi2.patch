@@ -1,0 +1,35 @@
+diff --git a/render/src/vk/window_switch.cpp b/render/src/vk/window_switch.cpp
+index d6960fc..d309d8f 100644
+--- a/render/src/vk/window_switch.cpp
++++ b/render/src/vk/window_switch.cpp
+@@ -551,7 +551,7 @@ void Window::destroy() {
+ 
+ // Beside the game, so the bindings travel with the app folder on the SD card.
+ std::string default_bindings_path() {
+-    return "sdmc:/switch/sonicadv/bindings.txt";
++    return "sdmc:/switch/crazytaxi2/bindings.txt";
+ }
+ 
+ }  // namespace dream::render::vk
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index c05eabe..e990170 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -2566,7 +2566,7 @@ int main(int argc, char** argv) {
+         // SA-nx: the port menu's options.
+ #ifdef __SWITCH__
+         if (options_file.empty())
+-            options_file = "sdmc:/switch/sonicadv/sonicadv_options.txt";
++            options_file = "sdmc:/switch/crazytaxi2/crazytaxi2_options.txt";
+ #endif
+         live->options_path = options_file;
+         live->load_options();
+@@ -2574,7 +2574,7 @@ int main(int argc, char** argv) {
+         // SA-nx: every pipeline earlier runs needed, built now instead of mid-play.
+ #ifdef __SWITCH__
+         if (pipeline_cache_file.empty())
+-            pipeline_cache_file = "sdmc:/switch/sonicadv/sonicadv_pipelines.bin";
++            pipeline_cache_file = "sdmc:/switch/crazytaxi2/crazytaxi2_pipelines.bin";
+ #endif
+         if (!pipeline_cache_file.empty()) {
+             const auto from = std::chrono::steady_clock::now();

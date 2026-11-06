@@ -1,0 +1,67 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 8d1ef20..03ae558 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -600,9 +600,11 @@ struct Live {
+         // or a target that was just switched (its image holds nothing yet).
+         const bool no_wait = render_threaded && gpu_present && !paused() && !menu.is_open() &&
+                              !port.is_open() && !target_switched_ && std::getenv("CTDC_WAIT") == nullptr;
+-        if (no_wait && render_in_flight())
++        bool unwaited = false;
++        if (no_wait && render_in_flight()) {
+             ++presents_unwaited;
+-        else {
++            unwaited = true;
++        } else {
+             render_wait();  // SA-nx: the frame being shown, and everything below, is the render thread's
+             target_switched_ = false;
+         }
+@@ -627,6 +629,15 @@ struct Live {
+             return false;
+         update_counter(guest_cycles);
+         pump_menu();
++        // CTDC-nx (switch-test6 crash): the menu can open in pump_menu, after the no-wait choice
++        // was made. A menu composites through the CPU, reading the offscreen target's pixels,
++        // which must never happen with a render still on the render thread: test6 crashed in
++        // vkCmdEndRenderPass with both threads recording on the same target when Mark opened the
++        // port menu right after closing it. Wait now if the picture will not be the GPU copy.
++        if (unwaited && (paused() || menu.is_open() || port.is_open())) {
++            render_wait();
++            unwaited = false;
++        }
+ 
+         dream::render::FramebufferInfo fb;
+         const bool described = dream::render::describe_framebuffer(pvr_.reg_block(), fb);
+@@ -722,20 +733,25 @@ struct Live {
+         ++presented;
+         // SA-nx: new pipelines go to the SD card within a few seconds, so a run closed from the
+         // HOME menu still keeps them.
+-        if (presented % 300 == 0 && renderer.pipelines_dirty() && renderer.save_pipelines())
++        // CTDC-nx: the renderer is the render thread's while a render is in flight (no-wait
++        // present), so saving, screenshots and captures wait for it first.
++        const bool want_save = presented % 300 == 0;
++        const bool want_shot = window.pressed(dream::render::vk::Control::Screenshot) ||
++                               (screenshot_at && presented == screenshot_at);
++        const bool want_capture = window.pressed(dream::render::vk::Control::Capture) ||
++                                  (capture_at && presented == capture_at);
++        if (want_save || want_shot || want_capture)
++            render_wait();
++        if (want_save && renderer.pipelines_dirty() && renderer.save_pipelines())
+             std::printf("pipelines: saved %u\n", renderer.pipelines);
+         if (window.pressed(dream::render::vk::Control::ToggleFps)) {
+             show_fps = !show_fps;
+             options.show_fps = show_fps;
+             fps_mark = {};  // start the next average fresh rather than from whenever it last ran
+         }
+-        if (window.pressed(dream::render::vk::Control::Screenshot))
+-            screenshot();
+-        if (window.pressed(dream::render::vk::Control::Capture))
+-            capture();
+-        if (screenshot_at && presented == screenshot_at)
++        if (want_shot)
+             screenshot();
+-        if (capture_at && presented == capture_at)
++        if (want_capture)
+             capture();
+     }
+ 

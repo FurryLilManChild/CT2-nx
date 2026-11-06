@@ -1,0 +1,539 @@
+diff --git a/render/include/dream/render/vk/context.h b/render/include/dream/render/vk/context.h
+index f8b6915..242eb79 100644
+--- a/render/include/dream/render/vk/context.h
++++ b/render/include/dream/render/vk/context.h
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -43,6 +44,10 @@ public:
+     VkPhysicalDevice physical_device() const noexcept { return physical_; }
+     VkDevice device() const noexcept { return device_; }
+     VkQueue queue() const noexcept { return queue_; }
++    // CTDC-nx: the queue is shared by the render thread (offscreen renders) and the game thread
++    // (presents). Vulkan requires one submitter at a time, and the no-wait present lets both
++    // submit while a render is in flight, so every vkQueueSubmit and vkQueuePresentKHR holds this.
++    std::mutex& queue_mutex() const noexcept { return queue_mu_; }
+     std::uint32_t queue_family() const noexcept { return queue_family_; }
+     const DeviceCapabilities& caps() const noexcept { return caps_; }
+     const std::string& error() const noexcept { return error_; }
+@@ -54,6 +59,7 @@ private:
+     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkQueue queue_ = VK_NULL_HANDLE;
++    mutable std::mutex queue_mu_;
+     VkDebugUtilsMessengerEXT debug_ = VK_NULL_HANDLE;
+     std::uint32_t queue_family_ = 0;
+     DeviceCapabilities caps_;
+diff --git a/render/src/vk/offscreen.cpp b/render/src/vk/offscreen.cpp
+index 8d34ae9..9cc0f45 100644
+--- a/render/src/vk/offscreen.cpp
++++ b/render/src/vk/offscreen.cpp
+@@ -1,5 +1,6 @@
+ // See offscreen.h.
+ #include "dream/render/vk/offscreen.h"
++#include <mutex>
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -359,7 +360,10 @@ void Offscreen::destroy_oit() {
+ 
+ void Offscreen::destroy() {
+     if (ctx_ && ctx_->device())
+-        vkDeviceWaitIdle(ctx_->device());
++        {
++            std::lock_guard<std::mutex> qlock(ctx_->queue_mutex());  // CTDC-nx
++            vkDeviceWaitIdle(ctx_->device());
++        }
+     pending_ = false;
+     destroy_oit();
+     if (ctx_ && ctx_->device()) {
+@@ -650,7 +654,7 @@ bool Offscreen::render(Renderer& renderer, const Frame& frame, const FrameGeomet
+     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &cmd_;
+-    if (vkQueueSubmit(ctx_->queue(), 1, &si, fence_) != VK_SUCCESS) {
++    if ([&] { std::lock_guard<std::mutex> qlock(ctx_->queue_mutex()); return vkQueueSubmit(ctx_->queue(), 1, &si, fence_); }() != VK_SUCCESS) {
+         error_ = "vkQueueSubmit failed";
+         return false;
+     }
+@@ -766,7 +770,7 @@ const std::uint32_t* Offscreen::pixels() {
+         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+         si.commandBufferCount = 1;
+         si.pCommandBuffers = &cmd_;
+-        if (vkQueueSubmit(ctx_->queue(), 1, &si, fence_) != VK_SUCCESS)
++        if ([&] { std::lock_guard<std::mutex> qlock(ctx_->queue_mutex()); return vkQueueSubmit(ctx_->queue(), 1, &si, fence_); }() != VK_SUCCESS)
+             return nullptr;
+         pending_ = true;
+         if (!finish())
+@@ -811,7 +815,7 @@ bool Offscreen::read_oit(std::vector<std::uint32_t>& heads, std::vector<std::uin
+     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &cmd_;
+-    if (vkQueueSubmit(ctx_->queue(), 1, &si, fence_) != VK_SUCCESS)
++    if ([&] { std::lock_guard<std::mutex> qlock(ctx_->queue_mutex()); return vkQueueSubmit(ctx_->queue(), 1, &si, fence_); }() != VK_SUCCESS)
+         return false;
+     pending_ = true;
+     if (!finish())
+diff --git a/render/src/vk/renderer.cpp b/render/src/vk/renderer.cpp
+index f9aa3e0..e7f755d 100644
+--- a/render/src/vk/renderer.cpp
++++ b/render/src/vk/renderer.cpp
+@@ -1,5 +1,6 @@
+ // See renderer.h.
+ #include "dream/render/vk/renderer.h"
++#include <mutex>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -738,7 +739,10 @@ void Renderer::draw(VkCommandBuffer cmd, const Frame& frame, const FrameGeometry
+ void Renderer::destroy() {
+     if (!ctx_ || !ctx_->device())
+         return;
+-    vkDeviceWaitIdle(ctx_->device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_->queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_->device());
++    }
+     for (auto& [key, pipeline] : pipelines_) vkDestroyPipeline(ctx_->device(), pipeline, nullptr);
+     pipelines_.clear();
+     if (pipeline_cache_)
+diff --git a/render/src/vk/texture_cache.cpp b/render/src/vk/texture_cache.cpp
+index 7e3d2a6..398fb4e 100644
+--- a/render/src/vk/texture_cache.cpp
++++ b/render/src/vk/texture_cache.cpp
+@@ -1,5 +1,6 @@
+ // See texture_cache.h.
+ #include "dream/render/vk/texture_cache.h"
++#include <mutex>
+ 
+ #include <cstring>
+ 
+@@ -57,7 +58,10 @@ void TextureCache::set_memory(const std::uint8_t* vram, std::size_t vram_size,
+ void TextureCache::invalidate() {
+     if (!ctx_ || !ctx_->device())
+         return;
+-    vkDeviceWaitIdle(ctx_->device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_->queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_->device());
++    }
+     for (auto& [key, e] : entries_) free_entry(e);
+     entries_.clear();
+ }
+@@ -102,7 +106,10 @@ std::size_t TextureCache::invalidate_range(std::uint32_t begin, std::uint32_t en
+     }
+     if (doomed.empty())
+         return 0;
+-    vkDeviceWaitIdle(ctx_->device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_->queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_->device());
++    }
+     for (std::uint64_t key : doomed) {
+         auto it = entries_.find(key);
+         if (it == entries_.end())
+diff --git a/render/src/vk/window.cpp b/render/src/vk/window.cpp
+index 0b0f03d..fa2d720 100644
+--- a/render/src/vk/window.cpp
++++ b/render/src/vk/window.cpp
+@@ -1,4 +1,5 @@
+ // See window.h.
++#include <mutex>
+ #include "dream/render/vk/window.h"
+ 
+ #include <algorithm>
+@@ -274,7 +275,10 @@ bool Window::create_swapchain() {
+ void Window::destroy_swapchain() {
+     if (!ctx_.device())
+         return;
+-    vkDeviceWaitIdle(ctx_.device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_.device());
++    }
+     for (VkFramebuffer f : framebuffers_) vkDestroyFramebuffer(ctx_.device(), f, nullptr);
+     for (VkImageView v : views_) vkDestroyImageView(ctx_.device(), v, nullptr);
+     framebuffers_.clear();
+@@ -570,7 +574,10 @@ bool Window::end_frame(std::uint32_t image_index) {
+     si.pCommandBuffers = &cmd;
+     si.signalSemaphoreCount = 1;
+     si.pSignalSemaphores = &rendered_[frame_];
+-    vkQueueSubmit(ctx_.queue(), 1, &si, fences_[frame_]);
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkQueueSubmit(ctx_.queue(), 1, &si, fences_[frame_]);
++    }
+ 
+     VkPresentInfoKHR pi{};
+     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+@@ -579,7 +586,11 @@ bool Window::end_frame(std::uint32_t image_index) {
+     pi.swapchainCount = 1;
+     pi.pSwapchains = &swapchain_;
+     pi.pImageIndices = &image_index;
+-    const VkResult r = vkQueuePresentKHR(ctx_.queue(), &pi);
++    VkResult r;
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        r = vkQueuePresentKHR(ctx_.queue(), &pi);
++    }
+     last_presented_ = image_index;
+     frame_ = (frame_ + 1) % kFramesInFlight;
+     return r == VK_SUCCESS;
+@@ -589,7 +600,10 @@ bool Window::read_pixels(std::vector<std::uint8_t>& out, std::uint32_t& width,
+                          std::uint32_t& height) {
+     if (images_.empty())
+         return false;
+-    vkDeviceWaitIdle(ctx_.device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_.device());
++    }
+     width = extent_.width;
+     height = extent_.height;
+     const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4;
+@@ -639,8 +653,14 @@ bool Window::read_pixels(std::vector<std::uint8_t>& out, std::uint32_t& width,
+     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &cmd;
+-    vkQueueSubmit(ctx_.queue(), 1, &si, VK_NULL_HANDLE);
+-    vkQueueWaitIdle(ctx_.queue());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkQueueSubmit(ctx_.queue(), 1, &si, VK_NULL_HANDLE);
++    }
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkQueueWaitIdle(ctx_.queue());
++    }
+ 
+     // The swapchain format is BGRA; hand back RGB.
+     out.resize(static_cast<std::size_t>(width) * height * 3);
+@@ -657,7 +677,10 @@ bool Window::read_pixels(std::vector<std::uint8_t>& out, std::uint32_t& width,
+ 
+ void Window::destroy() {
+     if (ctx_.device()) {
+-        vkDeviceWaitIdle(ctx_.device());
++        {
++            std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++            vkDeviceWaitIdle(ctx_.device());
++        }
+         destroy_swapchain();
+         for (VkFence f : fences_) vkDestroyFence(ctx_.device(), f, nullptr);
+         for (VkSemaphore s : acquired_) vkDestroySemaphore(ctx_.device(), s, nullptr);
+diff --git a/render/src/vk/window_switch.cpp b/render/src/vk/window_switch.cpp
+index d309d8f..0ebdff1 100644
+--- a/render/src/vk/window_switch.cpp
++++ b/render/src/vk/window_switch.cpp
+@@ -6,6 +6,7 @@
+ // name ("a" is the bottom face button, which the Switch calls B), so the same bindings file and
+ // the same binding screen work on both, and the Dreamcast's buttons sit where they did on a
+ // desktop pad.
++#include <mutex>
+ #include <switch.h>
+ #define VK_USE_PLATFORM_VI_NN 1
+ #include <vulkan/vulkan.h>
+@@ -290,7 +291,10 @@ bool Window::create_swapchain() {
+ void Window::destroy_swapchain() {
+     if (!ctx_.device())
+         return;
+-    vkDeviceWaitIdle(ctx_.device());
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkDeviceWaitIdle(ctx_.device());
++    }
+     for (VkFramebuffer f : framebuffers_) vkDestroyFramebuffer(ctx_.device(), f, nullptr);
+     for (VkImageView v : views_) vkDestroyImageView(ctx_.device(), v, nullptr);
+     framebuffers_.clear();
+@@ -503,7 +507,10 @@ bool Window::end_frame(std::uint32_t image_index) {
+     si.pCommandBuffers = &cmd;
+     si.signalSemaphoreCount = 1;
+     si.pSignalSemaphores = &rendered_[frame_];
+-    vkQueueSubmit(ctx_.queue(), 1, &si, fences_[frame_]);
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        vkQueueSubmit(ctx_.queue(), 1, &si, fences_[frame_]);
++    }
+     VkPresentInfoKHR pi{};
+     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     pi.waitSemaphoreCount = 1;
+@@ -511,7 +518,11 @@ bool Window::end_frame(std::uint32_t image_index) {
+     pi.swapchainCount = 1;
+     pi.pSwapchains = &swapchain_;
+     pi.pImageIndices = &image_index;
+-    const VkResult r = vkQueuePresentKHR(ctx_.queue(), &pi);
++    VkResult r;
++    {
++        std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++        r = vkQueuePresentKHR(ctx_.queue(), &pi);
++    }
+     last_presented_ = image_index;
+     frame_ = (frame_ + 1) % kFramesInFlight;
+     return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+@@ -527,7 +538,10 @@ bool Window::read_pixels(std::vector<std::uint8_t>& out, std::uint32_t& width,
+ 
+ void Window::destroy() {
+     if (ctx_.device()) {
+-        vkDeviceWaitIdle(ctx_.device());
++        {
++            std::lock_guard<std::mutex> qlock(ctx_.queue_mutex());  // CTDC-nx
++            vkDeviceWaitIdle(ctx_.device());
++        }
+         destroy_swapchain();
+         for (VkFence f : fences_) vkDestroyFence(ctx_.device(), f, nullptr);
+         for (VkSemaphore s : acquired_) vkDestroySemaphore(ctx_.device(), s, nullptr);
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index e990170..8d1ef20 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -540,6 +540,12 @@ struct Live {
+                         skipped_s * 1000.0, guest_s > 0 ? 100.0 * skipped_s / guest_s : 0.0);
+             perf_idle_last = is;
+         }
++        // CTDC-nx: refreshes that showed the frame before the one still being rendered.
++        if (presents_unwaited != perf_unwaited_at) {
++            std::printf("pacing: %llu refreshes did not wait for the render in flight\n",
++                        static_cast<unsigned long long>(presents_unwaited - perf_unwaited_at));
++            perf_unwaited_at = presents_unwaited;
++        }
+         // SA-nx: screen refreshes that kept the last finished frame (PortOptions::pacing).
+         if (presents_skipped != perf_skipped_at) {
+             std::printf("pacing: %llu refreshes kept the last finished frame\n",
+@@ -585,7 +591,21 @@ struct Live {
+             return window.poll() && !quit_requested;
+         }
+         skipped_last_present_ = false;
+-        render_wait();  // SA-nx: the frame being shown, and everything below, is the render thread's
++        // CTDC-nx (switch-test6): show every frame without waiting for the one in flight. Low
++        // latency waited here for the render thread (about 30% of the game thread at 1785 MHz in
++        // switch-test5). The window copies from the offscreen image on the GPU queue, so when the
++        // newest render is still on the render thread, the copy shows the one before it: every
++        // frame is shown once, one refresh late, and the game runs on. Waits as before whenever
++        // the picture could come from anything but that GPU copy: a menu, the CPU present path,
++        // or a target that was just switched (its image holds nothing yet).
++        const bool no_wait = render_threaded && gpu_present && !paused() && !menu.is_open() &&
++                             !port.is_open() && !target_switched_ && std::getenv("CTDC_WAIT") == nullptr;
++        if (no_wait && render_in_flight())
++            ++presents_unwaited;
++        else {
++            render_wait();  // SA-nx: the frame being shown, and everything below, is the render thread's
++            target_switched_ = false;
++        }
+         if (perf_enabled)
+             perf_log(guest_cycles);
+         dream_port_phase = paused() ? 1 : 0;
+@@ -901,6 +921,7 @@ struct Live {
+         off_->finish();  // nothing of the old target's is in flight when its pipelines go
+         t->rebind_oit();
+         off_ = t;
++        target_switched_ = true;  // CTDC-nx: the next present waits for this target's first render
+         target_scale_ = want;
+         // The timing log compares counts; start them over from this target's.
+         perf_stats_last = off_->stats;
+@@ -1327,6 +1348,8 @@ struct Live {
+     bool job_in_game_ = true, job_charsel_ = false;
+     std::uint32_t seen_screen_ = ~0u, seen_flag_ = ~0u;
+     int menu_logged_ = -1, logged_translucency_ = -1;
++    std::uint64_t presents_unwaited = 0, perf_unwaited_at = 0;  // CTDC-nx: no-wait presents
++    bool target_switched_ = false;  // CTDC-nx: set when off_ changes, until a present waited
+     std::uint64_t presents_skipped = 0, perf_skipped_at = 0, pacing_rebased = 0;  // SA-nx: refreshes left on the last finished frame
+     static constexpr std::size_t kJobRegWords = 0x200 / 4;  // the background plane's registers
+     std::vector<std::uint32_t> job_regs_;
+@@ -2260,6 +2283,7 @@ int main(int argc, char** argv) {
+                 cfg.disc_image = found[0];
+             }
+         }
++        dream::gdrom::on_worker_thread = dream_port_on_thread;  // CTDC-nx: the CHD decompressor
+         disc = dream::gdrom::open_disc(*cfg.disc_image, err);
+         if (!disc) {
+             std::fprintf(stderr, "disc: %s\n", err.c_str());
+diff --git a/runtime/include/dream/runtime/gdrom/disc.h b/runtime/include/dream/runtime/gdrom/disc.h
+index 7ddfbd1..9334770 100644
+--- a/runtime/include/dream/runtime/gdrom/disc.h
++++ b/runtime/include/dream/runtime/gdrom/disc.h
+@@ -58,4 +58,8 @@ protected:
+ // Opens by extension: .gdi or .chd. Returns nullptr and sets `error` on failure.
+ std::unique_ptr<Disc> open_disc(const std::filesystem::path& path, std::string& error);
+ 
++// CTDC-nx: called at the start of the disc reader's own threads (the CHD decompressor), so a
++// port can pin them to a core. Null by default.
++extern void (*on_worker_thread)(const char* name);
++
+ }  // namespace dream::gdrom
+diff --git a/runtime/src/gdrom/disc.cpp b/runtime/src/gdrom/disc.cpp
+index 2e2c286..ae97d20 100644
+--- a/runtime/src/gdrom/disc.cpp
++++ b/runtime/src/gdrom/disc.cpp
+@@ -343,12 +343,12 @@ public:
+         }
+         const chd_header* h = chd_get_header(chd_);
+         hunk_bytes_ = h->hunkbytes;
++        total_hunks_ = h->totalhunks;
+         frames_per_hunk_ = hunk_bytes_ / kFrameBytes;
+         if (frames_per_hunk_ == 0) {
+             error = "CHD hunk smaller than one CD frame";
+             return false;
+         }
+-        hunk_buf_.resize(hunk_bytes_);
+         return parse_tracks(error);
+     }
+ 
+@@ -358,10 +358,11 @@ public:
+             if (lba < t.lba || lba >= t.end_lba())
+                 continue;
+             const std::uint32_t frame = ct.chd_frame + (lba - t.lba);
+-            const std::uint8_t* f = frame_ptr(frame);
+-            if (!f)
++            const std::shared_ptr<Hunk> h = hunk_for(frame / frames_per_hunk_);
++            const std::size_t at = static_cast<std::size_t>(frame % frames_per_hunk_) * kFrameBytes;
++            if (!h || !h->ok || at + t.sector_size > h->data.size())
+                 return false;
+-            std::memcpy(out, f, t.sector_size);
++            std::memcpy(out, h->data.data() + at, t.sector_size);
+             if (!t.data)  // chdman stores audio big-endian; the disc is little-endian
+                 for (std::uint32_t i = 0; i + 1 < t.sector_size; i += 2)
+                     std::swap(out[i], out[i + 1]);
+@@ -371,6 +372,13 @@ public:
+     }
+ 
+     ~ChdDisc() override {
++        {
++            std::lock_guard<std::mutex> lock(mu_);
++            stop_ = true;
++        }
++        cv_.notify_all();
++        if (worker_.joinable())
++            worker_.join();
+         if (chd_)
+             chd_close(chd_);
+     }
+@@ -459,25 +467,115 @@ private:
+         return true;
+     }
+ 
+-    const std::uint8_t* frame_ptr(std::uint32_t frame) {
+-        const std::uint32_t hunk = frame / frames_per_hunk_;
+-        if (hunk != cached_hunk_) {
+-            if (chd_read(chd_, hunk, hunk_buf_.data()) != CHDERR_NONE)
+-                return nullptr;
+-            cached_hunk_ = hunk;
++    // CTDC-nx (switch-test6): hunks are decompressed on a thread of their own, kAhead hunks ahead
++    // of the one being read, and kept in a cache of kMaxHunks. Crazy Taxi streams from the disc
++    // while you drive, and decompressing on the game thread was about 7% of it at 1785 MHz in
++    // switch-test5 (hunk_read_into_memory). libchdr's chd_file is not shared between threads:
++    // only the worker ever calls chd_read; the game thread asks and waits when it must.
++    struct Hunk {
++        std::vector<std::uint8_t> data;
++        bool ready = false, ok = false;
++    };
++    static constexpr std::uint32_t kAhead = 24;
++    static constexpr std::size_t kMaxHunks = 2048;  // about 40 MB with 8-frame hunks
++
++    std::shared_ptr<Hunk> hunk_for(std::uint32_t hunk) {
++        if (hunk >= total_hunks_)
++            return nullptr;
++        std::unique_lock<std::mutex> lock(mu_);
++        start_worker();
++        std::shared_ptr<Hunk> h;
++        auto it = hunks_.find(hunk);
++        if (it == hunks_.end()) {
++            h = std::make_shared<Hunk>();
++            insert(hunk, h);
++            queue_.push_front(hunk);  // the one the game is waiting for goes first
++            cv_.notify_all();
++        } else {
++            h = it->second;
++            touch(hunk);
+         }
+-        return hunk_buf_.data() + static_cast<std::size_t>(frame % frames_per_hunk_) * kFrameBytes;
++        for (std::uint32_t k = 1; k <= kAhead && hunk + k < total_hunks_; ++k)
++            if (hunks_.find(hunk + k) == hunks_.end()) {
++                insert(hunk + k, std::make_shared<Hunk>());
++                queue_.push_back(hunk + k);
++                cv_.notify_all();
++            }
++        if (!h->ready) {
++            ++waits_;
++            cv_.wait(lock, [&] { return h->ready; });
++        }
++        return h;
++    }
++
++    // With mu_ held.
++    void insert(std::uint32_t key, std::shared_ptr<Hunk> h) {
++        hunks_[key] = std::move(h);
++        lru_.push_front(key);
++        where_[key] = lru_.begin();
++        while (hunks_.size() > kMaxHunks) {
++            const std::uint32_t old = lru_.back();
++            auto it = hunks_.find(old);
++            if (it != hunks_.end() && !it->second->ready)
++                break;  // still queued or being read; it goes on a later insert
++            lru_.pop_back();
++            where_.erase(old);
++            hunks_.erase(old);  // a reader holding it keeps its copy alive
++        }
++    }
++    void touch(std::uint32_t key) {
++        auto w = where_.find(key);
++        if (w != where_.end())
++            lru_.splice(lru_.begin(), lru_, w->second);
++    }
++    void start_worker() {
++        if (worker_.joinable())
++            return;
++        worker_ = std::thread([this] {
++            if (on_worker_thread)
++                on_worker_thread("disc");
++            std::vector<std::uint8_t> buf(hunk_bytes_);
++            std::unique_lock<std::mutex> lock(mu_);
++            for (;;) {
++                cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
++                if (stop_)
++                    return;
++                const std::uint32_t key = queue_.front();
++                queue_.pop_front();
++                auto it = hunks_.find(key);
++                if (it == hunks_.end() || it->second->ready)
++                    continue;
++                std::shared_ptr<Hunk> h = it->second;
++                lock.unlock();
++                const bool ok = chd_read(chd_, key, buf.data()) == CHDERR_NONE;
++                lock.lock();
++                if (ok)
++                    h->data = buf;
++                h->ok = ok;
++                h->ready = true;
++                cv_.notify_all();
++            }
++        });
+     }
+ 
+     chd_file* chd_ = nullptr;
+-    std::uint32_t hunk_bytes_ = 0, frames_per_hunk_ = 0;
+-    std::uint32_t cached_hunk_ = 0xFFFFFFFFu;
+-    std::vector<std::uint8_t> hunk_buf_;
++    std::uint32_t hunk_bytes_ = 0, frames_per_hunk_ = 0, total_hunks_ = 0;
++    std::mutex mu_;
++    std::condition_variable cv_;
++    std::unordered_map<std::uint32_t, std::shared_ptr<Hunk>> hunks_;
++    std::list<std::uint32_t> lru_;
++    std::unordered_map<std::uint32_t, std::list<std::uint32_t>::iterator> where_;
++    std::deque<std::uint32_t> queue_;
++    std::thread worker_;
++    bool stop_ = false;
++    std::uint64_t waits_ = 0;  // reads that had to wait for the worker
+     std::vector<ChdTrack> layout_;
+ };
+ 
+ }  // namespace
+ 
++void (*on_worker_thread)(const char* name) = nullptr;
++
+ std::unique_ptr<Disc> open_disc(const std::filesystem::path& path, std::string& error) {
+     std::string ext = path.extension().string();
+     for (auto& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));

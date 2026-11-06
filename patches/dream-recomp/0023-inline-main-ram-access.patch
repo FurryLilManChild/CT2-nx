@@ -1,0 +1,414 @@
+diff --git a/runtime/include/dream/runtime/mem/dc_memory.h b/runtime/include/dream/runtime/mem/dc_memory.h
+index da93d0a..15ae621 100644
+--- a/runtime/include/dream/runtime/mem/dc_memory.h
++++ b/runtime/include/dream/runtime/mem/dc_memory.h
+@@ -150,14 +150,14 @@ public:
+     std::function<void()> on_device_access;
+     // Development write watch: stores that touch [watch_lo, watch_hi) call on_watch_write with
+     // the guest address and value (the launcher's DREAM_WATCH_WRITE).
+-    std::uint32_t watch_lo = 1, watch_hi = 0;
++    // (watch_lo and watch_hi are Memory's, so the inline store path can see them.)
+     std::function<void(std::uint32_t addr, std::uint32_t value, unsigned size)> on_watch_write;
+ 
+     // Development aid: a rolling hash of every guest store. Two runs of the same program that
+     // agree on this did the same thing, whether one was translated and the other interpreted, so
+     // comparing it frame by frame finds where a translated run first goes wrong
+     // (docs/differential-harness.md). Off by default, and one predictable branch when on.
+-    bool hash_writes = false;
++    // (hash_writes is Memory's, so the inline store path can see it.)
+     std::uint64_t write_hash = 0, writes_hashed = 0;
+     // Once the hashes say which frame diverged, the individual writes in a window around it say
+     // which one: [log_from, log_to) are reported with their index, so two runs can be diffed line
+@@ -182,7 +182,7 @@ public:
+         std::uint64_t old_value, new_value;
+         unsigned size;
+     };
+-    bool journaling = false;
++    // (journaling is Memory's, so the inline store path can see it.)
+     bool journal_saw_device = false;
+     std::vector<WriteRecord> journal;
+     // Puts back what the journalled stores overwrote, newest first, and clears the journal.
+@@ -238,15 +238,16 @@ public:
+     void set_qacr(unsigned n, std::uint32_t v) noexcept { qacr_[n & 1] = v & 0x1Cu; }
+     std::uint32_t qacr(unsigned n) const noexcept { return qacr_[n & 1]; }
+ 
+-    // Memory interface
+-    std::uint8_t read8(std::uint32_t a) override;
+-    std::uint16_t read16(std::uint32_t a) override;
+-    std::uint32_t read32(std::uint32_t a) override;
+-    std::uint64_t read64(std::uint32_t a) override;
+-    void write8(std::uint32_t a, std::uint8_t v) override;
+-    void write16(std::uint32_t a, std::uint16_t v) override;
+-    void write32(std::uint32_t a, std::uint32_t v) override;
+-    void write64(std::uint32_t a, std::uint64_t v) override;
++    // Memory interface. read8 and the rest are Memory's: main RAM is served there, inline, and
++    // everything else arrives here.
++    std::uint8_t do_read8(std::uint32_t a) override;
++    std::uint16_t do_read16(std::uint32_t a) override;
++    std::uint32_t do_read32(std::uint32_t a) override;
++    std::uint64_t do_read64(std::uint32_t a) override;
++    void do_write8(std::uint32_t a, std::uint8_t v) override;
++    void do_write16(std::uint32_t a, std::uint16_t v) override;
++    void do_write32(std::uint32_t a, std::uint32_t v) override;
++    void do_write64(std::uint32_t a, std::uint64_t v) override;
+     void sq_write32(std::uint32_t a, std::uint32_t v) override;
+     void sq_flush(std::uint32_t a) override;
+ 
+@@ -277,6 +278,7 @@ private:
+     bool vram_dirty_any_ = false;
+     std::vector<Range> phys_mmio_, p4_mmio_;
+     std::uint32_t sq_[2][8]{};
++    bool quiet_device_access_ = false;  // SA-nx: sq_flush into area 4 (see there)
+     std::uint32_t qacr_[2]{};
+     std::uint32_t ccn_[16]{};  // PTEH..QACR1 word registers at 0xFF000000 + 4n (CCR, TRA, EXPEVT,
+                                // INTEVT, QACR aliased)
+diff --git a/runtime/include/dream/runtime/memory.h b/runtime/include/dream/runtime/memory.h
+index 6680b09..1eed387 100644
+--- a/runtime/include/dream/runtime/memory.h
++++ b/runtime/include/dream/runtime/memory.h
+@@ -11,22 +11,118 @@
+ #include <stdexcept>
+ #include <string>
+ 
++// SA-nx: the game's units are built at -O1 (/O1), which does not reliably inline even small
++// in-class functions; the inline memory path below is worthless as a call.
++#if defined(_MSC_VER)
++#define DREAM_ALWAYS_INLINE __forceinline
++#else
++#define DREAM_ALWAYS_INLINE inline __attribute__((always_inline))
++#endif
++
+ namespace dream {
+ 
+ class Memory {
+ public:
+     virtual ~Memory() = default;
+-    virtual std::uint8_t read8(std::uint32_t addr) = 0;
+-    virtual std::uint16_t read16(std::uint32_t addr) = 0;
+-    virtual std::uint32_t read32(std::uint32_t addr) = 0;
+-    virtual std::uint64_t read64(std::uint32_t addr) = 0;
+-    virtual void write8(std::uint32_t addr, std::uint8_t v) = 0;
+-    virtual void write16(std::uint32_t addr, std::uint16_t v) = 0;
+-    virtual void write32(std::uint32_t addr, std::uint32_t v) = 0;
+-    virtual void write64(std::uint32_t addr, std::uint64_t v) = 0;
++
++    // SA-nx: what emitted code calls. Main RAM (area 3 and its mirrors in P0 to P3) is most of
++    // every frame's accesses, so an implementation that hands out its RAM buffer (fast_ram_) gets
++    // those served right here, inline in the emitted code, with no virtual call and no address
++    // decode. Everything else, and every store while something is watching stores (the replay
++    // journal, the write hash, the write watch), goes to the implementation as before. The profile
++    // on Mark's PC put the virtual calls and the store path at about 45% of the game thread.
++    DREAM_ALWAYS_INLINE std::uint8_t read8(std::uint32_t a) {
++        if (const std::uint8_t* p = fast_load(a))
++            return *p;
++        return do_read8(a);
++    }
++    DREAM_ALWAYS_INLINE std::uint16_t read16(std::uint32_t a) { return fast_read<std::uint16_t>(a, &Memory::do_read16); }
++    DREAM_ALWAYS_INLINE std::uint32_t read32(std::uint32_t a) { return fast_read<std::uint32_t>(a, &Memory::do_read32); }
++    DREAM_ALWAYS_INLINE std::uint64_t read64(std::uint32_t a) { return fast_read<std::uint64_t>(a, &Memory::do_read64); }
++    DREAM_ALWAYS_INLINE void write8(std::uint32_t a, std::uint8_t v) {
++        if (std::uint8_t* p = fast_store(a)) {
++            *p = v;
++            return;
++        }
++        do_write8(a, v);
++    }
++    DREAM_ALWAYS_INLINE void write16(std::uint32_t a, std::uint16_t v) { fast_write(a, v, &Memory::do_write16); }
++    DREAM_ALWAYS_INLINE void write32(std::uint32_t a, std::uint32_t v) { fast_write(a, v, &Memory::do_write32); }
++    DREAM_ALWAYS_INLINE void write64(std::uint32_t a, std::uint64_t v) { fast_write(a, v, &Memory::do_write64); }
++    // SA-nx: the inline path's state, for emitted functions that keep it in locals (FastMem).
++    // sq: the two 32-byte store queues (0xE0000000..0xE3FFFFFF, address bit 5 picks one), or
++    // null when stores to them must take the full path.
++    struct FastView {
++        std::uint8_t* ram;
++        std::uint32_t mask;
++        bool store_ok;
++        std::uint8_t* sq;
++    };
++    DREAM_ALWAYS_INLINE FastView fast_view() const noexcept {
++        const bool ok =
++            fast_ram_ != nullptr && !journaling && !hash_writes && !(watch_lo < watch_hi);
++        return {fast_ram_, fast_ram_mask_, ok, ok ? fast_sq_ : nullptr};
++    }
+     // Store queue: writes to 0xE0000000..0xE3FFFFFF buffer in the SQ; PREF flushes 32 bytes.
+     virtual void sq_write32(std::uint32_t addr, std::uint32_t v) = 0;
+     virtual void sq_flush(std::uint32_t addr) = 0;
++
++    // Store observers. They live here rather than in the implementation so the inline store path
++    // can see them: while any is armed, every store takes the implementation's full path.
++    // A journal of guest stores that can be undone (DcMemory::undo_journal).
++    bool journaling = false;
++    // The rolling hash of every guest store (DcMemory::note_write).
++    bool hash_writes = false;
++    // Stores that touch [watch_lo, watch_hi) call DcMemory::on_watch_write.
++    std::uint32_t watch_lo = 1, watch_hi = 0;
++
++protected:
++    virtual std::uint8_t do_read8(std::uint32_t addr) = 0;
++    virtual std::uint16_t do_read16(std::uint32_t addr) = 0;
++    virtual std::uint32_t do_read32(std::uint32_t addr) = 0;
++    virtual std::uint64_t do_read64(std::uint32_t addr) = 0;
++    virtual void do_write8(std::uint32_t addr, std::uint8_t v) = 0;
++    virtual void do_write16(std::uint32_t addr, std::uint16_t v) = 0;
++    virtual void do_write32(std::uint32_t addr, std::uint32_t v) = 0;
++    virtual void do_write64(std::uint32_t addr, std::uint64_t v) = 0;
++
++    // The implementation's main RAM, mirrored every (fast_ram_mask_ + 1) bytes across area 3;
++    // null keeps every access on the virtual path.
++    std::uint8_t* fast_ram_ = nullptr;
++    std::uint32_t fast_ram_mask_ = 0;
++    std::uint8_t* fast_sq_ = nullptr;  // SA-nx: the store queues' 64 bytes (FastView::sq)
++
++private:
++    // Area 3 seen through P0 to P3: physical = a & 0x1FFFFFFF, area = physical >> 26. P4
++    // (0xE0000000 and above) is on-chip and never RAM.
++    DREAM_ALWAYS_INLINE const std::uint8_t* fast_load(std::uint32_t a) const noexcept {
++        if (fast_ram_ && a < 0xE0000000u && ((a >> 26) & 7u) == 3u)
++            return fast_ram_ + (a & fast_ram_mask_);
++        return nullptr;
++    }
++    DREAM_ALWAYS_INLINE std::uint8_t* fast_store(std::uint32_t a) const noexcept {
++        if (fast_ram_ && a < 0xE0000000u && ((a >> 26) & 7u) == 3u && !journaling &&
++            !hash_writes && !(watch_lo < watch_hi))
++            return fast_ram_ + (a & fast_ram_mask_);
++        return nullptr;
++    }
++    template <typename T>
++    DREAM_ALWAYS_INLINE T fast_read(std::uint32_t a, T (Memory::*slow)(std::uint32_t)) {
++        if (const std::uint8_t* p = fast_load(a)) {
++            T v;
++            std::memcpy(&v, p, sizeof v);
++            return v;
++        }
++        return (this->*slow)(a);
++    }
++    template <typename T>
++    DREAM_ALWAYS_INLINE void fast_write(std::uint32_t a, T v, void (Memory::*slow)(std::uint32_t, T)) {
++        if (std::uint8_t* p = fast_store(a)) {
++            std::memcpy(p, &v, sizeof v);
++            return;
++        }
++        (this->*slow)(a, v);
++    }
+ };
+ 
+ // 16 MB of main RAM at every alias of area 3 (0x0C000000 physical), nothing else. Accesses outside
+@@ -38,31 +134,36 @@ public:
+     BareMemory() : ram_(new std::uint8_t[kRamSize]()) {}
+ 
+     std::uint8_t* ram() noexcept { return ram_.get(); }
++    // SA-nx: serve area 3 inline as DcMemory does, so tests cover both paths of emitted code.
++    void use_fast_path(bool on) noexcept {
++        fast_ram_ = on ? ram_.get() : nullptr;
++        fast_ram_mask_ = kRamSize - 1;
++    }
+ 
+-    std::uint8_t read8(std::uint32_t a) override { return ram_[idx(a)]; }
+-    std::uint16_t read16(std::uint32_t a) override {
++    std::uint8_t do_read8(std::uint32_t a) override { return ram_[idx(a)]; }
++    std::uint16_t do_read16(std::uint32_t a) override {
+         std::uint16_t v;
+         std::memcpy(&v, ram_.get() + idx(a), 2);
+         return v;
+     }
+-    std::uint32_t read32(std::uint32_t a) override {
++    std::uint32_t do_read32(std::uint32_t a) override {
+         std::uint32_t v;
+         std::memcpy(&v, ram_.get() + idx(a), 4);
+         return v;
+     }
+-    std::uint64_t read64(std::uint32_t a) override {
++    std::uint64_t do_read64(std::uint32_t a) override {
+         std::uint64_t v;
+         std::memcpy(&v, ram_.get() + idx(a), 8);
+         return v;
+     }
+-    void write8(std::uint32_t a, std::uint8_t v) override { ram_[idx(a)] = v; }
+-    void write16(std::uint32_t a, std::uint16_t v) override {
++    void do_write8(std::uint32_t a, std::uint8_t v) override { ram_[idx(a)] = v; }
++    void do_write16(std::uint32_t a, std::uint16_t v) override {
+         std::memcpy(ram_.get() + idx(a), &v, 2);
+     }
+-    void write32(std::uint32_t a, std::uint32_t v) override {
++    void do_write32(std::uint32_t a, std::uint32_t v) override {
+         std::memcpy(ram_.get() + idx(a), &v, 4);
+     }
+-    void write64(std::uint32_t a, std::uint64_t v) override {
++    void do_write64(std::uint32_t a, std::uint64_t v) override {
+         std::memcpy(ram_.get() + idx(a), &v, 8);
+     }
+     void sq_write32(std::uint32_t a, std::uint32_t v) override { sq_[(a >> 2) & 15] = v; }
+diff --git a/runtime/src/mem/dc_memory.cpp b/runtime/src/mem/dc_memory.cpp
+index bcc1279..8486c7e 100644
+--- a/runtime/src/mem/dc_memory.cpp
++++ b/runtime/src/mem/dc_memory.cpp
+@@ -64,7 +64,12 @@ DcMemory::DcMemory()
+       aram_(new std::uint8_t[kAramSize]()),
+       bios_(new std::uint8_t[kBiosSize]()),
+       flash_(new std::uint8_t[kFlashSize]()),
+-      ocram_(new std::uint8_t[kOcramSize]()) {}
++      ocram_(new std::uint8_t[kOcramSize]()) {
++    // Main RAM for Memory's inline path (SA-nx).
++    fast_ram_ = ram_.get();
++    fast_sq_ = reinterpret_cast<std::uint8_t*>(&sq_[0][0]);
++    fast_ram_mask_ = kRamSize - 1;
++}
+ 
+ void DcMemory::map_mmio(std::uint32_t lo, std::uint32_t hi, MmioHandler* h) {
+     phys_mmio_.push_back({lo, hi, h});
+@@ -105,7 +110,7 @@ DcMemory::Target DcMemory::resolve(std::uint32_t a, unsigned size, bool write) {
+         }
+         if (MmioHandler* h = find(p4_mmio_, a)) {
+             t.kind = Target::kMmio;
+-            if (on_device_access)
++            if (on_device_access && !quiet_device_access_)
+                 on_device_access();
+             t.mmio = h;
+             t.mmio_addr = a;
+@@ -160,7 +165,7 @@ DcMemory::Target DcMemory::resolve(std::uint32_t a, unsigned size, bool write) {
+     }
+     if (MmioHandler* h = find(phys_mmio_, phys)) {
+         t.kind = Target::kMmio;
+-        if (on_device_access)
++        if (on_device_access && !quiet_device_access_)
+             on_device_access();
+         t.mmio = h;
+         t.mmio_addr = phys;
+@@ -249,13 +254,13 @@ void DcMemory::redo_journal() {
+     }
+ }
+ 
+-std::uint8_t DcMemory::read8(std::uint32_t a) {
++std::uint8_t DcMemory::do_read8(std::uint32_t a) {
+     return load<std::uint8_t>(a);
+ }
+-std::uint16_t DcMemory::read16(std::uint32_t a) {
++std::uint16_t DcMemory::do_read16(std::uint32_t a) {
+     return load<std::uint16_t>(a);
+ }
+-std::uint32_t DcMemory::read32(std::uint32_t a) {
++std::uint32_t DcMemory::do_read32(std::uint32_t a) {
+     if ((a & 0xFFFFFFC0u) == 0xFF000000u) {  // CCN: MMU and cache control, exception registers
+         switch (a & 0x3Cu) {
+             case 0x20:
+@@ -274,7 +279,7 @@ std::uint32_t DcMemory::read32(std::uint32_t a) {
+     }
+     return load<std::uint32_t>(a);
+ }
+-std::uint64_t DcMemory::read64(std::uint32_t a) {
++std::uint64_t DcMemory::do_read64(std::uint32_t a) {
+     const Target t = resolve(a, 8, false);
+     if (t.kind == Target::kBytes) {
+         std::uint64_t v;
+@@ -286,13 +291,21 @@ std::uint64_t DcMemory::read64(std::uint32_t a) {
+                (static_cast<std::uint64_t>(t.mmio->read(t.mmio_addr + 4, 4)) << 32);
+     return 0;
+ }
+-void DcMemory::write8(std::uint32_t a, std::uint8_t v) {
++void DcMemory::do_write8(std::uint32_t a, std::uint8_t v) {
+     store<std::uint8_t>(a, v);
+ }
+-void DcMemory::write16(std::uint32_t a, std::uint16_t v) {
++void DcMemory::do_write16(std::uint32_t a, std::uint16_t v) {
+     store<std::uint16_t>(a, v);
+ }
+-void DcMemory::write32(std::uint32_t a, std::uint32_t v) {
++void DcMemory::do_write32(std::uint32_t a, std::uint32_t v) {
++    // SA-nx: the store queues first. A game hands its display lists to the hardware by filling
++    // them a word at a time and flushing; each word went through the CCN check and resolve()
++    // before landing in sq_ (the Switch's test7 profile: resolve 4.3%, store 3.8%). With nothing
++    // watching stores the word goes straight in, exactly where resolve() would have put it.
++    if ((a & 0xFC000000u) == 0xE0000000u && !journaling && !tracing_writes()) {
++        std::memcpy(reinterpret_cast<std::uint8_t*>(&sq_[(a >> 5) & 1][0]) + (a & 0x1Cu), &v, 4);
++        return;
++    }
+     if ((a & 0xFFFFFFC0u) == 0xFF000000u) {
+         switch (a & 0x3Cu) {
+             case 0x20:
+@@ -317,7 +330,12 @@ void DcMemory::write32(std::uint32_t a, std::uint32_t v) {
+     }
+     store<std::uint32_t>(a, v);
+ }
+-void DcMemory::write64(std::uint32_t a, std::uint64_t v) {
++void DcMemory::do_write64(std::uint32_t a, std::uint64_t v) {
++    // SA-nx: the store queues, as in do_write32 (an FMOV pair writes them eight bytes at a time).
++    if ((a & 0xFC000000u) == 0xE0000000u && (a & 7u) == 0 && !journaling && !tracing_writes()) {
++        std::memcpy(reinterpret_cast<std::uint8_t*>(&sq_[(a >> 5) & 1][0]) + (a & 0x18u), &v, 8);
++        return;
++    }
+     const Target t = resolve(a, 8, true);
+     if (t.kind == Target::kBytes) {
+         const std::uint32_t lo = static_cast<std::uint32_t>(v);
+@@ -353,7 +371,12 @@ void DcMemory::sq_flush(std::uint32_t a) {
+     const unsigned n = (a >> 5) & 1;
+     const std::uint32_t dest = (qacr_[n] << 24) | (a & 0x03FFFFE0u);
+     const std::uint32_t* words = sq_[n];
++    // SA-nx: a burst into area 4 (the TA's FIFO, its texture path, the YUV converter) does not
++    // depend on the clock, so it skips bringing the scheduler up to date (on_device_access), which
++    // ran for every 32 bytes of every display list.
++    quiet_device_access_ = ((dest >> 26) & 7u) == 4u;
+     const Target t = resolve(dest, 4, true);
++    quiet_device_access_ = false;
+     if (t.kind == Target::kBytes) {
+         if (journaling)
+             for (unsigned i = 0; i < 8; ++i) {
+diff --git a/runtime/tests/test_memory.cpp b/runtime/tests/test_memory.cpp
+index c12552c..604ee9e 100644
+--- a/runtime/tests/test_memory.cpp
++++ b/runtime/tests/test_memory.cpp
+@@ -280,3 +280,55 @@ TEST_CASE("memory: writes to video memory are reported as page runs") {
+     CHECK(runs.empty());
+ }
+ 
++
++TEST_CASE("memory: the inline path through Memory& matches the device path") {
++    // SA-nx: emitted code holds a Memory&. Main RAM is served inline from it, everything else
++    // reaches DcMemory, and an armed write hash sends every store down the full path again.
++    DcMemory dc;
++    dream::Memory& m = dc;
++    m.write64(0x8C004000u, 0x0102030405060708ull);
++    CHECK(m.read64(0xAC004000u) == 0x0102030405060708ull);
++    CHECK(dc.ram()[0x4000] == 0x08);  // the same bytes DcMemory owns
++    m.write32(0xA5000100u, 0x12345678u);  // VRAM: not area 3, so DcMemory's path
++    CHECK(m.read32(0xA5000100u) == 0x12345678u);
++
++    dc.hash_writes = true;
++    const std::uint64_t before = dc.writes_hashed;
++    m.write32(0x8C004010u, 1u);
++    m.write8(0x8C004014u, 2u);
++    CHECK(dc.writes_hashed == before + 2);  // both stores reached the hash
++    dc.hash_writes = false;
++    m.write32(0x8C004018u, 3u);
++    CHECK(dc.writes_hashed == before + 2);  // and the inline path is back once it is off
++    CHECK(m.read32(0x8C004018u) == 3u);
++}
++
++TEST_CASE("memory: store-queue words written by the quick path reach RAM on the flush") {
++    // SA-nx: do_write32 and do_write64 put store-queue words straight into the queue when nothing
++    // watches stores. Both queues, both widths, then a flush to RAM through QACR, must give the
++    // same bytes as before; with the write hash armed the full path still runs and sees them.
++    DcMemory m;
++    dream::Memory& mem = m;
++    m.set_qacr(0, 0x0Cu);  // area 3 (RAM): bits 4:2 = 3
++    m.set_qacr(1, 0x0Cu);
++    for (unsigned q = 0; q < 2; ++q) {
++        const std::uint32_t base = 0xE0000000u + q * 32u;
++        mem.write64(base, 0x1111111100000000ull + q);
++        mem.write32(base + 8, 0x22220000u + q);
++        mem.write32(base + 12, 0x33330000u + q);
++        mem.write64(base + 16, 0x5555555544444444ull);
++        mem.write64(base + 24, 0x7777777766666666ull);
++        m.sq_flush(0xE0001000u + q * 32u);
++        const std::uint32_t ram = 0x8C001000u + q * 32u;
++        CHECK(m.read32(ram) == q);
++        CHECK(m.read32(ram + 4) == 0x11111111u);
++        CHECK(m.read32(ram + 8) == 0x22220000u + q);
++        CHECK(m.read32(ram + 12) == 0x33330000u + q);
++        CHECK(m.read32(ram + 16) == 0x44444444u);
++        CHECK(m.read32(ram + 28) == 0x77777777u);
++    }
++    m.hash_writes = true;
++    const std::uint64_t before = m.writes_hashed;
++    mem.write32(0xE0000000u, 9u);
++    CHECK(m.writes_hashed == before + 1);  // the full path, which reports to the hash
++}
