@@ -2,6 +2,16 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: first PC build stopped before compiling
+
+- build_pc.log held only its header; `out\dream-pin.tar` was left behind and
+  `out\dream-patched\` was empty, so Apply-Patches stopped unpacking the pinned sources (the tar
+  is intact: it unpacks on the bridge). Most likely `tar` on Mark's PATH is Git's GNU tar, which
+  reads `C:\...` as a remote host. That step came from ZombieRev-nx's Switch phase and had not
+  run on the PC before.
+- Fix: Windows' own `System32\tar.exe` by full path, and the git and tar error text now goes
+  into build_pc.log, so a failure there names its cause next time.
+
 ## 2026-11-06: kickoff
 
 - Repo set up from ZombieRev-nx (the newest patch set 0001 to 0034, PC scripts, Switch layer),

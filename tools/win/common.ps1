@@ -101,10 +101,21 @@ function Apply-Patches {
     New-Item -ItemType Directory -Force -Path $patched | Out-Null
     # The commit the superproject pins, not the submodule's HEAD.
     $pin = (& git -C $Root rev-parse HEAD:dream-recomp).Trim()
-    & git -C $sub archive -o $tarFile $pin 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'git archive of dream-recomp failed. Tell Claude.' }
-    & tar -xf $tarFile -C $patched 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Unpacking dream-recomp failed. Tell Claude.' }
+    $msg = & git -C $sub archive -o $tarFile $pin 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log 'build_pc.log' "git archive failed: $msg"
+        throw 'git archive of dream-recomp failed. Tell Claude.'
+    }
+    # CT2-nx: Windows' own tar (bsdtar) by full path. A plain `tar` can be Git's GNU tar, which
+    # reads "C:\..." as a remote host and fails (CT2-nx's first PC build, 2026-11-06).
+    $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (-not (Test-Path $tarExe)) { $tarExe = 'tar' }
+    Write-Log 'build_pc.log' "unpacking the pinned sources with $tarExe"
+    $msg = & $tarExe -xf $tarFile -C $patched 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log 'build_pc.log' "unpacking failed: $msg"
+        throw 'Unpacking dream-recomp failed. Tell Claude.'
+    }
     Remove-Item $tarFile -Force
     & git -C $patched init -q 2>&1 | Out-Null
     foreach ($p in $patches) {
