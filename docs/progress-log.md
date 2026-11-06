@@ -2,6 +2,31 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: depth A/B result; the flicker is a texture race, not depth
+
+- Mark: no change in any depth variant. 15 captures; 005 to 014 at a building where the flicker
+  was strong (F11).
+- What the captures show: the building's lower facade (a stone band and the glass above the
+  entrance, top left) is a flat blue-grey slab in 010, 013 and 014 and correct in 009, 011 and
+  012, with the camera almost still.
+- The display lists of 009 and 010 hold the same strips in that area (tadump, a small display
+  list dumper on dream-recomp's DisplayList; only the HUD text differs). The opaque strips there
+  use depth mode 4 (greater), cull mode 2 or 3: so the tie bias (modes 6 and 3 only) never applied.
+- Re-rendering 010 offline (tools/rcap on lavapipe, from the capture's list, video memory and
+  registers) draws the facade correctly, in every translucency mode and with greater-or-equal
+  depth. The same list and the same video memory give the right picture; the game's own render of
+  it did not. So the facade's texture was decoded from video memory holding something else at the
+  moment the render thread read it.
+- The render thread decodes textures from live video memory after the game thread has moved on
+  (boot_main.cpp says so: "which the guest could be writing at that moment"). Crazy Taxi 2
+  streams the city's textures while driving; a texture slot rewritten between the render's start
+  and the render thread's decode shows the new contents, and the next frame's invalidation
+  corrects it: the flicker. Not yet proven on the PC.
+- Test: boot_test.ps1 -RenderOnGameThread (DREAM_RENDER_THREAD=0) draws on the game thread as each
+  render starts, reading video memory as the game left it then. No rebuild needed. If the flicker
+  is gone, the fix is to hold the game's video memory writes while a render is still reading
+  textures, keeping the render thread.
+
 ## 2026-11-06: translucency A/B result; depth ties next
 
 - Mark: the flicker did not change with the translucency mode; it shows most on painted road
