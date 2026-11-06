@@ -1,0 +1,161 @@
+diff --git a/render/include/dream/render/vk/renderer.h b/render/include/dream/render/vk/renderer.h
+index b0dec81..bbd8f87 100644
+--- a/render/include/dream/render/vk/renderer.h
++++ b/render/include/dream/render/vk/renderer.h
+@@ -76,6 +76,11 @@ public:
+     // triangle keyed on its farthest vertex (Flycast's default, "per triangle"): closer to the
+     // hardware than per strip, much cheaper than per pixel, still not exact.
+     bool sort_triangles = false;
++    // CT2-nx: how opaque and punch-through depth is written (geometry.frag): 0 as computed,
++    // 1 a tiny bias toward passing for the non-strict comparisons (greater-or-equal, less-or-equal),
++    // so a polygon drawn on the same plane as one already there wins the tie every time, 2 rounded
++    // to 2^-20 so near-equal values compare equal. Painted road lines flickered in Crazy Taxi 2.
++    int depth_variant = 0;
+ 
+     // SA-nx: pipelines built ahead of play. `path` holds the driver's pipeline cache (compiled
+     // shader code) and, beside it with ".keys" appended, the list of pipeline variants earlier runs
+diff --git a/render/shaders/geometry.frag b/render/shaders/geometry.frag
+index 4e43480..2439d32 100644
+--- a/render/shaders/geometry.frag
++++ b/render/shaders/geometry.frag
+@@ -40,5 +40,20 @@ void main() {
+         discard;
+ 
+     o_colour = clamp(colour, 0.0, 1.0);
+-    gl_FragDepth = pvr_depth(v_uv.z);
++    // CT2-nx: Renderer::depth_variant (bits 16-17) for polygons on the same plane as one drawn
++    // before them, such as painted road lines: two triangles interpolate 1/w a hair apart, so a
++    // tie the hardware's comparison would pass came out either way from pixel to pixel and frame
++    // to frame. Bits 7-9 are the comparison (6 greater-or-equal, 3 less-or-equal; nearer is larger).
++    float d = pvr_depth(v_uv.z);
++    const int variant = (push.mode >> 16) & 3;
++    const int compare = (push.mode >> 7) & 7;
++    if (variant == 1) {
++        if (compare == 6)
++            d += 1.0e-6;
++        else if (compare == 3)
++            d -= 1.0e-6;
++    } else if (variant == 2) {
++        d = floor(d * 1048576.0 + 0.5) / 1048576.0;
++    }
++    gl_FragDepth = d;
+ }
+diff --git a/render/src/vk/renderer.cpp b/render/src/vk/renderer.cpp
+index e7f755d..76ff9ed 100644
+--- a/render/src/vk/renderer.cpp
++++ b/render/src/vk/renderer.cpp
+@@ -716,6 +716,8 @@ void Renderer::draw(VkCommandBuffer cmd, const Frame& frame, const FrameGeometry
+         if (item.blended)
+             ++blended_polygons;
+         push.alpha_ref = geometry.alpha_ref;
++        if (!gather)  // CT2-nx: the comparison and the depth variant, for geometry.frag
++            push.mode |= static_cast<std::int32_t>((key.depth_mode << 7) | ((depth_variant & 3) << 16));
+         if (gather) {
+             push.mode |= static_cast<std::int32_t>((key.depth_mode << 7) | (key.src_blend << 10) |
+                                                    (key.dst_blend << 13));
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 2a72857..40617e9 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -639,6 +639,38 @@ struct Live {
+                             static_cast<double>(guest_cycles) / 200e6);
+             }
+         }
++        // CT2-nx: CT2_DEPTH_AB=N cycles Renderer::depth_variant (as computed, tie bias, rounded)
++        // every N seconds of game time, logged and on the FPS counter, for the flickering road lines.
++        if (depth_ab_s_ < 0) {
++            const char* ab = std::getenv("CT2_DEPTH_AB");
++            depth_ab_s_ = ab ? std::max(0, std::atoi(ab)) : 0;
++            if (depth_ab_s_)
++                std::printf("depth a/b: as computed, tie bias and rounded in turn, %d s each\n",
++                            depth_ab_s_);
++        }
++        if (depth_ab_s_ > 0) {
++            const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / depth_ab_s_);
++            const int variant = slot % 3;
++            if (variant != depth_ab_mode_.load()) {
++                depth_ab_mode_.store(variant);
++                std::printf("depth a/b: %s from %.1f s\n", depth_label(variant),
++                            static_cast<double>(guest_cycles) / 200e6);
++            }
++        }
++        // CT2-nx: CT2_CAPTURE_EVERY=N writes a capture (as F11 does) every N seconds of game time,
++        // so a flicker on screen leaves frames to render again offline without a key press.
++        if (capture_every_s_ < 0) {
++            const char* ev = std::getenv("CT2_CAPTURE_EVERY");
++            capture_every_s_ = ev ? std::max(0, std::atoi(ev)) : 0;
++        }
++        if (capture_every_s_ > 0) {
++            const std::uint64_t slot = guest_cycles / (200'000'000ull * static_cast<unsigned>(capture_every_s_));
++            if (slot != capture_slot_) {
++                if (capture_slot_ != ~0ull)
++                    capture_due_ = true;
++                capture_slot_ = slot;
++            }
++        }
+         bool ab_wait = false;
+         if (present_ab_s_ > 0) {
+             const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / present_ab_s_);
+@@ -795,7 +827,8 @@ struct Live {
+         const bool want_shot = window.pressed(dream::render::vk::Control::Screenshot) ||
+                                (screenshot_at && presented == screenshot_at);
+         const bool want_capture = window.pressed(dream::render::vk::Control::Capture) ||
+-                                  (capture_at && presented == capture_at);
++                                  (capture_at && presented == capture_at) || capture_due_;
++        capture_due_ = false;
+         if (want_save || want_shot || want_capture)
+             render_wait();
+         if (want_save && renderer.pipelines_dirty() && renderer.save_pipelines())
+@@ -816,10 +849,12 @@ struct Live {
+     // since the pixels underneath are not on the CPU to blend with.
+     void draw_counter_tile(std::uint32_t frame_width) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s", fps_shown, speed_shown,
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s", fps_shown, speed_shown,
+                       present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
+                       translucency_ab_mode_.load() >= 0 ? "  " : "",
+-                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "");
++                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "",
++                      depth_ab_mode_.load() >= 0 ? "  " : "",
++                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "");
+         dream::render::TextStyle style;
+         style.scale = std::max(2u, 2u * (frame_width / kGuestWidth));
+         style.bg = 0;
+@@ -944,6 +979,7 @@ struct Live {
+         off_->allow_oit = per_pixel;
+         off_->lean_oit = mode == 2;
+         renderer.sort_triangles = mode == 3;
++        renderer.depth_variant = std::max(0, depth_ab_mode_.load());
+         const int here = in_game ? 2 : charsel ? 1 : 0;
+         if (here != menu_logged_) {
+             menu_logged_ = here;
+@@ -1274,10 +1310,12 @@ struct Live {
+     // stays the same size relative to the picture however the window is resized.
+     void draw_counter(std::uint32_t* px, std::uint32_t w, std::uint32_t h) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s", fps_shown, speed_shown,
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s", fps_shown, speed_shown,
+                       present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
+                       translucency_ab_mode_.load() >= 0 ? "  " : "",
+-                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "");
++                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "",
++                      depth_ab_mode_.load() >= 0 ? "  " : "",
++                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "");
+         dream::render::TextStyle style;
+         // One text pixel per two guest pixels at --scale 1, and the same apparent size at every
+         // scale above it, so the counter neither disappears nor swamps the picture.
+@@ -1439,6 +1477,14 @@ struct Live {
+     int present_ab_s_ = -1;          // CT2-nx: CT2_PRESENT_AB seconds, 0 off, -1 not read yet
+     int translucency_ab_s_ = -1;     // CT2-nx: CT2_TRANSLUCENCY_AB seconds, 0 off, -1 not read yet
+     std::atomic<int> translucency_ab_mode_{-1};  // CT2-nx: the a/b's mode now (read on the render thread)
++    int depth_ab_s_ = -1;            // CT2-nx: CT2_DEPTH_AB seconds, 0 off, -1 not read yet
++    std::atomic<int> depth_ab_mode_{-1};  // CT2-nx: Renderer::depth_variant from the a/b
++    int capture_every_s_ = -1;       // CT2-nx: CT2_CAPTURE_EVERY seconds, 0 off, -1 not read yet
++    std::uint64_t capture_slot_ = ~0ull;
++    bool capture_due_ = false;
++    static const char* depth_label(int v) {
++        return v == 1 ? "DEPTH TIE BIAS" : v == 2 ? "DEPTH ROUNDED" : "DEPTH AS IS";
++    }
+     static const char* translucency_label(int mode) {
+         return mode == 0 ? "PER PIXEL" : mode == 1 ? "PER STRIP" : mode == 2 ? "PER PIXEL LEAN" : "PER TRIANGLE";
+     }

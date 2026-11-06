@@ -2,6 +2,21 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: translucency A/B result; depth ties next
+
+- Mark: the flicker did not change with the translucency mode; it shows most on painted road
+  lines, in all three modes. No F11 capture taken.
+- Reading: depth fighting between the road and the lines painted on it. The renderer writes
+  pvr_depth(1/w) per pixel (Flycast's log mapping); two triangles on one plane interpolate 1/w a
+  hair apart, so a greater-or-equal tie the hardware would pass comes out either way. Not yet
+  confirmed from a capture (which depth comparison the lines use is the open question).
+- Patch 0037: Renderer::depth_variant, applied in geometry.frag (opaque and punch-through): 0 as
+  computed, 1 +1e-6 for greater-or-equal (-1e-6 for less-or-equal) so the later polygon wins a
+  tie, 2 depth rounded to 2^-20. CT2_DEPTH_AB=N cycles them (boot_test.ps1 -DepthAB N) with the
+  label on the FPS counter; CT2_CAPTURE_EVERY=N (-CaptureEvery N) writes a capture every N game
+  seconds, so frames of the flicker reach Claude without a key press. Launcher, renderer and
+  shader compile-checked here (Switch compiler, glslc).
+
 ## 2026-11-06: present A/B result; ground flicker next
 
 - Second PC boot test (998 s build, 144 guest s, `-PresentAB 15`): untranslated call targets 0
