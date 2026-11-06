@@ -3,8 +3,10 @@
 #   out\logs\boot.log          everything the launcher printed
 #   out\logs\boot-report.txt   where the run got to and why it stopped
 #   out\logs\suggested.toml    code the run reached that is not translated yet (Claude merges it)
-#   powershell -ExecutionPolicy Bypass -File tools\win\boot_test.ps1 [-Seconds 120] [-Headless]
-param([int]$Seconds = 120, [switch]$Headless, [string]$Game = 'crazytaxi2')
+#   powershell -ExecutionPolicy Bypass -File tools\win\boot_test.ps1 [-Seconds 120] [-Headless] [-PresentAB 15]
+#   -PresentAB N: every N game seconds, switch between showing frames without waiting for the one
+#   being drawn and waiting for it (CT2-nx patch 0035); the FPS counter shows WAIT or NO WAIT.
+param([int]$Seconds = 120, [switch]$Headless, [int]$PresentAB = 0, [string]$Game = 'crazytaxi2')
 . "$PSScriptRoot\common.ps1"
 if (-not (Test-Path $GameExe)) { throw 'Not built yet. Run tools\win\build_pc.ps1 first.' }
 Start-Log 'boot.log' "boot_test $GameId $Seconds s" | Out-Null
@@ -24,6 +26,7 @@ $a += @('--options', $OptionsFile, '--perf-log')
 # (switch_main.cpp has the details).
 if ($GameId -eq 'crazytaxi2') { $a += @('--idle-skip', '0x0C154190:0x0C155960,0x0C1559A0', '--whole-game') }
 if (-not $Headless) { $a += '--window' }
+if ($PresentAB -gt 0) { $env:CT2_PRESENT_AB = "$PresentAB" } else { Remove-Item Env:CT2_PRESENT_AB -ErrorAction SilentlyContinue }
 Write-Host "Booting $GameId for up to $Seconds game seconds (more in real time while it runs slow) ..."
 $rc = Invoke-Logged $GameExe $a 'boot' '^frame'
 Write-Host "Finished (exit $rc). Tell Claude the boot test is done; logs are in out\logs."

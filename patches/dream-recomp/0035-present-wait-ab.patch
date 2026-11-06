@@ -1,0 +1,67 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index e6ff89f..77ac321 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -607,8 +607,32 @@ struct Live {
+         // frame is shown once, one refresh late, and the game runs on. Waits as before whenever
+         // the picture could come from anything but that GPU copy: a menu, the CPU present path,
+         // or a target that was just switched (its image holds nothing yet).
++        // CT2-nx: CT2_PRESENT_AB=N alternates every N seconds of game time between this no-wait
++        // present and waiting for every render (as with CTDC_WAIT), logs each change, and puts the
++        // mode on the FPS counter, so one session compares the two on the same screen. For a
++        // report of jittery motion on the PC (2026-11-06), where about half the refreshes of play
++        // found the render still in flight.
++        if (present_ab_s_ < 0) {
++            const char* ab = std::getenv("CT2_PRESENT_AB");
++            present_ab_s_ = ab ? std::max(0, std::atoi(ab)) : 0;
++            if (present_ab_s_)
++                std::printf("present a/b: wait and no-wait alternate every %d s of game time\n",
++                            present_ab_s_);
++        }
++        bool ab_wait = false;
++        if (present_ab_s_ > 0) {
++            const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / present_ab_s_);
++            ab_wait = (slot & 1) != 0;
++            if (ab_wait != present_ab_wait_ || !present_ab_logged_) {
++                std::printf("present a/b: %s from %.1f s\n", ab_wait ? "WAIT" : "NO WAIT",
++                            static_cast<double>(guest_cycles) / 200e6);
++                present_ab_wait_ = ab_wait;
++                present_ab_logged_ = true;
++            }
++        }
+         const bool no_wait = render_threaded && gpu_present && !paused() && !menu.is_open() &&
+-                             !port.is_open() && !target_switched_ && std::getenv("CTDC_WAIT") == nullptr;
++                             !port.is_open() && !target_switched_ && !ab_wait &&
++                             std::getenv("CTDC_WAIT") == nullptr;
+         bool unwaited = false;
+         if (no_wait && render_in_flight()) {
+             ++presents_unwaited;
+@@ -769,7 +793,8 @@ struct Live {
+     // since the pixels underneath are not on the CPU to blend with.
+     void draw_counter_tile(std::uint32_t frame_width) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX", fps_shown, speed_shown);
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s", fps_shown, speed_shown,
++                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "");
+         dream::render::TextStyle style;
+         style.scale = std::max(2u, 2u * (frame_width / kGuestWidth));
+         style.bg = 0;
+@@ -1223,7 +1248,8 @@ struct Live {
+     // stays the same size relative to the picture however the window is resized.
+     void draw_counter(std::uint32_t* px, std::uint32_t w, std::uint32_t h) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX", fps_shown, speed_shown);
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s", fps_shown, speed_shown,
++                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "");
+         dream::render::TextStyle style;
+         // One text pixel per two guest pixels at --scale 1, and the same apparent size at every
+         // scale above it, so the counter neither disappears nor swamps the picture.
+@@ -1382,6 +1408,8 @@ struct Live {
+     std::uint32_t seen_screen_ = ~0u, seen_flag_ = ~0u;
+     int menu_logged_ = -1, logged_translucency_ = -1;
+     std::uint64_t presents_unwaited = 0, perf_unwaited_at = 0;  // CTDC-nx: no-wait presents
++    int present_ab_s_ = -1;          // CT2-nx: CT2_PRESENT_AB seconds, 0 off, -1 not read yet
++    bool present_ab_wait_ = false, present_ab_logged_ = false;  // CT2-nx: the current a/b mode
+     bool target_switched_ = false;  // CTDC-nx: set when off_ changes, until a present waited
+     std::uint64_t presents_skipped = 0, perf_skipped_at = 0, pacing_rebased = 0;  // SA-nx: refreshes left on the last finished frame
+     static constexpr std::size_t kJobRegWords = 0x200 / 4;  // the background plane's registers

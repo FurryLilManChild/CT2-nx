@@ -26,38 +26,45 @@ entry = 0x8C010000           # the first instruction
 # Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
 # here. Run the launcher with --suggest-config FILE and it writes them for you.
 [functions]
-extra = []
+# Call targets the 2026-11-06 PC boot test (120 guest s, into gameplay) reached untranslated.
+# The same functions as Crazy Taxi's first four seeds (CTDC-nx 0x0C081476, 0x0C081E56,
+# 0x0C0854A0, 0x0C086B74), the first of the two byte matches in each case.
+extra = [0x0C0814E6,  # 183,460 calls, the hottest code the run interpreted
+         0x0C081E9A,  # 15,691
+         0x0C088720,  # 625
+         0x0C093CA4]  # 1
 
-# Exception and interrupt stubs the startup copies below the program (VBR = 0x8C00F000 + 0x400,
-# 0x500, 0x800, 0xA00). Crazy Taxi 2 holds Crazy Taxi's four stubs byte for byte, only their
-# literal pointers into the program moved (0x0C16BF58 -> 0x0C1665B0, 0x0C16BC44 -> 0x0C1662A4),
-# so these are CTDC-nx's relocations at the new sources (2026-11-06). Stubs can patch their own
-# literal pool, so every literal is read at run time (no_fold). Never give 0x8C00FA00 extra
+# Exception and interrupt stubs the startup copies below the program: VBR = 0x8C000000 here
+# (Crazy Taxi's is 0x8C00F000), 0x000 from 0x0C166274 (called from 0x0C16658A on every
+# interrupt), 0x100 and 0x400 copies of one stub, 0x600 the interrupt stub. Crazy Taxi's four
+# stubs byte for byte, only their literal pointers into the program moved (0x0C16BF58 ->
+# 0x0C1665B0, 0x0C16BC44 -> 0x0C1662A4). Each was interpreted 56,688 times in the first boot test
+# (these relocations first went in at Crazy Taxi's addresses, unused). Stubs can patch their own
+# literal pool, so every literal is read at run time (no_fold). Never give the 0x600 stub extra
 # `entries`: in CTDC-nx that faulted at boot (switch-test3).
 [[relocations]]
 source = 0x0C166274
 size = 0x34
-dest = 0x8C00F400
+dest = 0x8C000000
 no_fold = true
 
 [[relocations]]
 source = 0x0C1661E0
 size = 0x34
-dest = 0x8C00F500
+dest = 0x8C000100
 no_fold = true
 
 [[relocations]]
 source = 0x0C1661E0
 size = 0x34
-dest = 0x8C00F800
+dest = 0x8C000400
 no_fold = true
 
 [[relocations]]
 source = 0x0C166218
 size = 0x58
-dest = 0x8C00FA00
+dest = 0x8C000600
 no_fold = true
 
 # Crazy Taxi also copies startup code to 0x8C004000 and 0x8C004E0C and small routines to
-# 0x8C00EB90..0x8C00F0F4 and 0x8C00F720; Crazy Taxi 2's versions differ, so they come from the
-# first boot test's suggestions.
+# 0x8C00EB90..0x8C00F0F4 and 0x8C00F720; the first boot test found no such copies in Crazy Taxi 2.

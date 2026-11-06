@@ -2,6 +2,29 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: first PC boot test; jitter A/B next
+
+- Built in 1,020 s (90 files from the patch set). Boot test, 120 guest s: title, menus and into
+  gameplay. Mark: pretty smooth, but the picture looks jittery in motion.
+- Gameplay at 0.99x to 1.00x, 59.8 to 59.9 fps shown and 59.9 renders/s, game thread 44 to 59%
+  busy. Idle skip works: "the empty function at 0x0C154190, 2 wait loops", up to 83% of guest
+  time skipped in menus. Early loading stretches at 0.40x to 0.66x with the game thread 85 to 91%
+  busy, while the interpreter ran untranslated code.
+- In play, 81 to 192 of every 300 refreshes found the render still in flight and presented
+  without waiting (patch 0027): the GPU copy then shows the frame before, so frames mix one
+  refresh late and on time, which can repeat one frame and skip the next. The likely cause of the
+  jitter, not proven: the PC's display refresh (the Legion Go's screen can run at 144 Hz) would
+  judder 60 fps too.
+- Untranslated: 0x0C0814E6 (183,460 calls), 0x0C081E9A (15,691), 0x0C088720 (625),
+  0x0C093CA4 (1), the same functions as Crazy Taxi's first four seeds; and 0x8C000000 and
+  0x8C000600, 56,688 calls each. Mistake: Crazy Taxi 2's VBR is 0x8C000000, not Crazy Taxi's
+  0x8C00F000, so the stub relocations went in at the wrong addresses. Fixed to 0x8C000000,
+  0x8C000100, 0x8C000400 and 0x8C000600 (suggested.toml agrees); seeds added. No startup copies
+  like Crazy Taxi's 0x8C004000 ones were suggested.
+- Patch 0035: CT2_PRESENT_AB=N (boot_test.ps1 -PresentAB N) alternates every N game seconds
+  between no-wait and waiting presents, logs each change ("present a/b: WAIT from 45.0 s") and
+  puts WAIT or NO WAIT on the FPS counter. Syntax-checked with the Switch compiler.
+
 ## 2026-11-06: first PC build stopped before compiling
 
 - build_pc.log held only its header; `out\dream-pin.tar` was left behind and
