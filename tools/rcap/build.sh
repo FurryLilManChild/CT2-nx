@@ -18,6 +18,8 @@ done
 for f in context resources renderer texture_cache offscreen; do
   g++ -std=c++20 -O1 -c -I$R/include -I$R/../runtime/include -I$O/spv $R/src/vk/$f.cpp -o $O/$f.o
 done
+# CT2-nx: the guard band cut (patch 0038), newer than most build dirs' libdream_render.a
+[ -f $R/src/guard_band.cpp ] && g++ -std=c++20 -O1 -c -I$R/include -I$R/../runtime/include $R/src/guard_band.cpp -o $O/guard_band.o
 g++ -std=c++20 -O1 -I$R/include -I$R/../runtime/include $ROOT/tools/rcap/rcap.cpp $O/*.o \
   $B/render/libdream_render.a $B/runtime/libdream_runtime.a -lvulkan -o $O/rcap
 echo "built $O/rcap"

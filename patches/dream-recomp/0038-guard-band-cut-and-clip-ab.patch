@@ -1,0 +1,556 @@
+diff --git a/render/CMakeLists.txt b/render/CMakeLists.txt
+index de9b125..3099558 100644
+--- a/render/CMakeLists.txt
++++ b/render/CMakeLists.txt
+@@ -15,6 +15,7 @@ add_library(dream_render STATIC
+   src/input.cpp
+   src/input_menu.cpp
+   src/port_menu.cpp  # SA-nx
++  src/guard_band.cpp  # CT2-nx
+ )
+ target_include_directories(dream_render PUBLIC include)
+ target_link_libraries(dream_render PUBLIC dream::runtime)
+@@ -23,7 +24,7 @@ add_library(dream::render ALIAS dream_render)
+ 
+ # The device-independent half is tested on every runner, with or without a GPU.
+ if(DREAM_BUILD_TESTS)
+-  add_executable(dream_render_tests tests/test_display_list.cpp tests/test_texture.cpp tests/test_framebuffer.cpp tests/test_tsp.cpp tests/test_background.cpp tests/test_fog.cpp tests/test_overlay.cpp tests/test_input.cpp tests/test_input_menu.cpp tests/test_port_menu.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
++  add_executable(dream_render_tests tests/test_display_list.cpp tests/test_texture.cpp tests/test_framebuffer.cpp tests/test_tsp.cpp tests/test_background.cpp tests/test_fog.cpp tests/test_overlay.cpp tests/test_input.cpp tests/test_input_menu.cpp tests/test_port_menu.cpp tests/test_guard_band.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
+   target_link_libraries(dream_render_tests PRIVATE dream::render)
+   target_include_directories(dream_render_tests SYSTEM PRIVATE ${DREAM_ROOT}/third_party/doctest)
+   dream_target_defaults(dream_render_tests)
+diff --git a/render/include/dream/render/guard_band.h b/render/include/dream/render/guard_band.h
+new file mode 100644
+index 0000000..b4f7fad
+--- /dev/null
++++ b/render/include/dream/render/guard_band.h
+@@ -0,0 +1,33 @@
++// CT2-nx: polygons that reach far beyond the screen, cut down before the GPU sees them.
++//
++// A game that clips to a near plane close to the camera sends the triangles of a wall or road
++// right beside it with corners up to millions of pixels off screen (Crazy Taxi 2: x -190,000,
++// y -2,000,000). Every GPU computes depth and texture coordinates across such a triangle in single
++// precision from those far corners, and how far off the result is depends on the GPU: on Mark's
++// AMD GPU a stone band 0.5% nearer than a wall behind it lost to that wall on some frames and won
++// on others, while a software renderer drew the same capture right every time. Cutting those
++// triangles to a band a little wider than the screen gives the GPU small numbers to work with.
++//
++// The cut is exact. The hardware's coordinates are already in screen space, where x, y, 1/w and
++// every attribute multiplied by 1/w vary linearly, so a new corner on a cut edge is a linear blend
++// of the two old ones and the picture inside the band does not change.
++#pragma once
++#include <cstdint>
++#include "dream/render/display_list.h"
++
++namespace dream::render {
++
++struct GuardBand {
++    float left = 0, top = 0, right = 640, bottom = 480;  // the screen, in guest pixels
++    // A strip is cut only when a vertex lies more than `reach` beyond the screen; its triangles are
++    // then cut to `margin` beyond it. The edges a cut makes are all off screen.
++    float reach = 1024, margin = 256;
++};
++
++// Returns `in` itself when no strip reaches beyond the band, otherwise `scratch`, filled with a
++// copy of `in` in which every such strip is replaced by its triangles, cut, each a strip of three
++// with the winding the original triangle had. `cut` (when given) receives the number of strips cut.
++const Frame& clip_to_guard_band(const Frame& in, const GuardBand& band, Frame& scratch,
++                                std::uint32_t* cut = nullptr);
++
++}  // namespace dream::render
+diff --git a/render/include/dream/render/vk/offscreen.h b/render/include/dream/render/vk/offscreen.h
+index a158717..782b057 100644
+--- a/render/include/dream/render/vk/offscreen.h
++++ b/render/include/dream/render/vk/offscreen.h
+@@ -20,6 +20,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "dream/render/guard_band.h"
+ #include "dream/render/vk/context.h"
+ #include "dream/render/vk/renderer.h"
+ #include "dream/render/vk/resources.h"
+@@ -94,6 +95,10 @@ public:
+     bool allow_oit = true;
+     // SA-nx: the lean resolve, 8 layers kept per pixel instead of 32 ("accurate (lean)").
+     bool lean_oit = false;
++    // CT2-nx: cut strips that reach far off screen before drawing (guard_band.h); `last_cut` is
++    // how many the last render cut.
++    bool guard_band = true;
++    std::uint32_t last_cut = 0;
+     // SA-nx: switches for the capture replayer (switch/replay), to find what makes the per-pixel
+     // pass slow on the Switch. All off in the game.
+     struct Experiment {
+@@ -125,6 +130,7 @@ public:
+     } stats;
+ 
+ private:
++    Frame guard_frame_;  // CT2-nx: the frame with its far-reaching strips cut, when any were
+     Context* ctx_ = nullptr;
+     VkExtent2D extent_{};
+     AttachmentImage colour_, depth_;
+diff --git a/render/src/guard_band.cpp b/render/src/guard_band.cpp
+new file mode 100644
+index 0000000..4bb7300
+--- /dev/null
++++ b/render/src/guard_band.cpp
+@@ -0,0 +1,175 @@
++// CT2-nx: see guard_band.h.
++#include "dream/render/guard_band.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace dream::render {
++namespace {
++
++// A vertex in the form that varies linearly across the screen: position, 1/w, and every
++// attribute multiplied by 1/w (texture coordinates and the eight colour channels).
++struct Linear {
++    double x, y, z, u, v;
++    double c[8];
++};
++
++Linear to_linear(const Vertex& s) {
++    Linear l{};
++    l.x = s.x;
++    l.y = s.y;
++    l.z = s.z;
++    l.u = static_cast<double>(s.u) * s.z;
++    l.v = static_cast<double>(s.v) * s.z;
++    for (int k = 0; k < 4; ++k) {
++        l.c[k] = static_cast<double>((s.base >> (8 * k)) & 0xFFu) * s.z;
++        l.c[4 + k] = static_cast<double>((s.offset >> (8 * k)) & 0xFFu) * s.z;
++    }
++    return l;
++}
++
++Vertex from_linear(const Linear& l) {
++    Vertex s;
++    s.x = static_cast<float>(l.x);
++    s.y = static_cast<float>(l.y);
++    s.z = static_cast<float>(l.z);
++    s.u = static_cast<float>(l.u / l.z);
++    s.v = static_cast<float>(l.v / l.z);
++    std::uint32_t base = 0, offset = 0;
++    for (int k = 0; k < 4; ++k) {
++        const auto channel = [&](double c) {
++            return static_cast<std::uint32_t>(std::clamp(std::lround(c / l.z), 0L, 255L));
++        };
++        base |= channel(l.c[k]) << (8 * k);
++        offset |= channel(l.c[4 + k]) << (8 * k);
++    }
++    s.base = base;
++    s.offset = offset;
++    return s;
++}
++
++Linear blend(const Linear& a, const Linear& b, double t) {
++    Linear r;
++    r.x = a.x + (b.x - a.x) * t;
++    r.y = a.y + (b.y - a.y) * t;
++    r.z = a.z + (b.z - a.z) * t;
++    r.u = a.u + (b.u - a.u) * t;
++    r.v = a.v + (b.v - a.v) * t;
++    for (int k = 0; k < 8; ++k) r.c[k] = a.c[k] + (b.c[k] - a.c[k]) * t;
++    return r;
++}
++
++// One Sutherland-Hodgman pass: keeps the part of `in` where side(vertex) >= 0, side being linear.
++template <typename Side>
++void clip_pass(const std::vector<Linear>& in, std::vector<Linear>& out, Side side) {
++    out.clear();
++    const std::size_t n = in.size();
++    for (std::size_t i = 0; i < n; ++i) {
++        const Linear& a = in[i];
++        const Linear& b = in[(i + 1) % n];
++        const double da = side(a), db = side(b);
++        if (da >= 0)
++            out.push_back(a);
++        if ((da >= 0) != (db >= 0))
++            out.push_back(blend(a, b, da / (da - db)));
++    }
++}
++
++bool outside(const Vertex& v, float x0, float y0, float x1, float y1) {
++    return !(v.x >= x0 && v.x <= x1 && v.y >= y0 && v.y <= y1);  // NaN counts as outside
++}
++
++}  // namespace
++
++const Frame& clip_to_guard_band(const Frame& in, const GuardBand& band, Frame& scratch,
++                                std::uint32_t* cut) {
++    const float rx0 = band.left - band.reach, ry0 = band.top - band.reach;
++    const float rx1 = band.right + band.reach, ry1 = band.bottom + band.reach;
++    const auto needs_cut = [&](const Polygon& p) {
++        for (std::uint32_t i = 0; i < p.count; ++i)
++            if (outside(in.vertices[p.first + i], rx0, ry0, rx1, ry1))
++                return true;
++        return false;
++    };
++    bool any = false;
++    for (const auto& list : in.lists)
++        for (const Polygon& p : list)
++            if (needs_cut(p)) {
++                any = true;
++                break;
++            }
++    if (cut)
++        *cut = 0;
++    if (!any)
++        return in;
++
++    const double mx0 = band.left - band.margin, my0 = band.top - band.margin;
++    const double mx1 = band.right + band.margin, my1 = band.bottom + band.margin;
++    scratch.vertices = in.vertices;
++    scratch.modifiers = in.modifiers;
++    scratch.min_z = in.min_z;
++    scratch.max_z = in.max_z;
++    scratch.strips = in.strips;
++    scratch.sprites = in.sprites;
++    scratch.dropped_vertices = in.dropped_vertices;
++    scratch.unknown_parameters = in.unknown_parameters;
++    std::vector<Linear> poly, tmp;
++    for (std::size_t l = 0; l < in.lists.size(); ++l) {
++        auto& out_list = scratch.lists[l];
++        out_list.clear();
++        for (const Polygon& p : in.lists[l]) {
++            if (!needs_cut(p)) {
++                out_list.push_back(p);
++                continue;
++            }
++            if (cut)
++                ++*cut;
++            const auto emit = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
++                Polygon q = p;
++                q.first = static_cast<std::uint32_t>(scratch.vertices.size());
++                q.count = 3;
++                scratch.vertices.push_back(a);
++                scratch.vertices.push_back(b);
++                scratch.vertices.push_back(c);
++                out_list.push_back(q);
++            };
++            for (std::uint32_t t = 0; t + 2 < p.count; ++t) {
++                // Every second triangle of a strip is wound the other way; on its own, as a strip
++                // of three, it is given the order that faces the way it faced in the strip.
++                const Vertex& a = in.vertices[p.first + t];
++                const Vertex& b = in.vertices[p.first + t + ((t & 1u) ? 2u : 1u)];
++                const Vertex& c = in.vertices[p.first + t + ((t & 1u) ? 1u : 2u)];
++                const double area = (static_cast<double>(b.x) - a.x) * (static_cast<double>(c.y) - a.y) -
++                                    (static_cast<double>(c.x) - a.x) * (static_cast<double>(b.y) - a.y);
++                if (area == 0.0 || std::isnan(area))
++                    continue;  // draws nothing either way
++                const bool inside = !outside(a, static_cast<float>(mx0), static_cast<float>(my0),
++                                             static_cast<float>(mx1), static_cast<float>(my1)) &&
++                                    !outside(b, static_cast<float>(mx0), static_cast<float>(my0),
++                                             static_cast<float>(mx1), static_cast<float>(my1)) &&
++                                    !outside(c, static_cast<float>(mx0), static_cast<float>(my0),
++                                             static_cast<float>(mx1), static_cast<float>(my1));
++                // 1/w at or below zero would make the attributes meaningless to divide back out;
++                // such a triangle is left as the game sent it.
++                if (inside || !(a.z > 0 && b.z > 0 && c.z > 0)) {
++                    emit(a, b, c);
++                    continue;
++                }
++                poly = {to_linear(a), to_linear(b), to_linear(c)};
++                clip_pass(poly, tmp, [&](const Linear& v) { return v.x - mx0; });
++                clip_pass(tmp, poly, [&](const Linear& v) { return mx1 - v.x; });
++                clip_pass(poly, tmp, [&](const Linear& v) { return v.y - my0; });
++                clip_pass(tmp, poly, [&](const Linear& v) { return my1 - v.y; });
++                if (poly.size() < 3)
++                    continue;  // wholly outside the band, so off screen
++                // A fan keeps the triangle's winding.
++                const Vertex v0 = from_linear(poly[0]);
++                for (std::size_t k = 1; k + 1 < poly.size(); ++k)
++                    emit(v0, from_linear(poly[k]), from_linear(poly[k + 1]));
++            }
++        }
++    }
++    return scratch;
++}
++
++}  // namespace dream::render
+diff --git a/render/src/vk/offscreen.cpp b/render/src/vk/offscreen.cpp
+index 9cc0f45..794e942 100644
+--- a/render/src/vk/offscreen.cpp
++++ b/render/src/vk/offscreen.cpp
+@@ -449,11 +449,21 @@ bool Offscreen::finish() {
+     return true;
+ }
+ 
+-bool Offscreen::render(Renderer& renderer, const Frame& frame, const FrameGeometry& geometry) {
++bool Offscreen::render(Renderer& renderer, const Frame& frame_in, const FrameGeometry& geometry) {
+     if (!ctx_ || !cmd_)
+         return false;
+     if (!finish())
+         return false;
++    // CT2-nx: strips with corners far off screen, cut to a band around it (guard_band.h). After
++    // finish(), so the copy the last render drew from is no longer needed.
++    last_cut = 0;
++    GuardBand band;
++    band.left = geometry.left;
++    band.top = geometry.top;
++    band.right = geometry.left + geometry.width;
++    band.bottom = geometry.top + geometry.height;
++    const Frame& frame =
++        guard_band ? clip_to_guard_band(frame_in, band, guard_frame_, &last_cut) : frame_in;
+     vkResetCommandBuffer(cmd_, 0);
+     VkCommandBufferBeginInfo bi{};
+     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+diff --git a/render/tests/test_guard_band.cpp b/render/tests/test_guard_band.cpp
+new file mode 100644
+index 0000000..fba991a
+--- /dev/null
++++ b/render/tests/test_guard_band.cpp
+@@ -0,0 +1,161 @@
++// CT2-nx: cutting far-reaching strips (guard_band.h). What has to hold: nothing changes on screen
++// (1/w and the perspective-correct attributes at any pixel inside the band are what the uncut
++// triangle gives there), every piece faces the way its triangle faced, and frames with nothing to
++// cut are passed through untouched.
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++#include "dream/render/guard_band.h"
++
++#include "doctest.h"
++
++namespace {
++
++using namespace dream::render;
++
++struct Sample {
++    bool hit = false;
++    double z = 0, u = 0, v = 0, red = 0;
++};
++
++// The exact value at (px, py) of the triangle (a, b, c), as the shader computes it: 1/w linear,
++// the attributes linear after multiplying by 1/w and divided back out.
++Sample sample(const Vertex& a, const Vertex& b, const Vertex& c, double px, double py) {
++    Sample s;
++    const double d = (double(b.y) - c.y) * (double(a.x) - c.x) + (double(c.x) - b.x) * (double(a.y) - c.y);
++    if (d == 0)
++        return s;
++    const double w0 = ((double(b.y) - c.y) * (px - c.x) + (double(c.x) - b.x) * (py - c.y)) / d;
++    const double w1 = ((double(c.y) - a.y) * (px - c.x) + (double(a.x) - c.x) * (py - c.y)) / d;
++    const double w2 = 1 - w0 - w1;
++    if (w0 < 0 || w1 < 0 || w2 < 0)
++        return s;
++    s.hit = true;
++    s.z = w0 * a.z + w1 * b.z + w2 * c.z;
++    s.u = (w0 * a.u * a.z + w1 * b.u * b.z + w2 * c.u * c.z) / s.z;
++    s.v = (w0 * a.v * a.z + w1 * b.v * b.z + w2 * c.v * c.z) / s.z;
++    s.red = (w0 * double(a.base & 0xFF) * a.z + w1 * double(b.base & 0xFF) * b.z +
++             w2 * double(c.base & 0xFF) * c.z) / s.z;
++    return s;
++}
++
++double area(const Vertex& a, const Vertex& b, const Vertex& c) {
++    return (double(b.x) - a.x) * (double(c.y) - a.y) - (double(c.x) - a.x) * (double(b.y) - a.y);
++}
++
++// The triangle of the strip `p` that covers the point, in the order the strip draws it.
++Sample sample_frame(const Frame& f, const Polygon& p, double px, double py) {
++    for (std::uint32_t t = 0; t + 2 < p.count; ++t) {
++        const Vertex& a = f.vertices[p.first + t];
++        const Vertex& b = f.vertices[p.first + t + 1];
++        const Vertex& c = f.vertices[p.first + t + 2];
++        Sample s = sample(a, b, c, px, py);
++        if (s.hit)
++            return s;
++    }
++    return {};
++}
++
++Vertex vtx(float x, float y, float z, float u, float v, std::uint32_t base) {
++    Vertex r;
++    r.x = x;
++    r.y = y;
++    r.z = z;
++    r.u = u;
++    r.v = v;
++    r.base = base;
++    return r;
++}
++
++// Shaped like the Crazy Taxi 2 strip that flickered: two corners near the camera and far off
++// screen, two on screen, as a strip of four (two triangles, the second wound the other way).
++Frame far_strip() {
++    Frame f;
++    f.vertices = {vtx(-190717.5f, -62760.0f, 3.333333f, 9.6f, -52.0f, 0xFF102030u),
++                  vtx(231.3f, 94.3f, 0.002436f, 30.5f, -51.0f, 0xFFC0C0C0u),
++                  vtx(-167595.7f, -2000673.0f, 3.333333f, 16.4f, 0.0f, 0xFF405060u),
++                  vtx(235.1f, 122.9f, 0.002365f, 31.0f, -52.0f, 0xFF808080u)};
++    Polygon p;
++    p.first = 0;
++    p.count = 4;
++    p.isp = 0x93000000u;
++    p.tcw = 0x88070368u;
++    f.lists[0].push_back(p);
++    return f;
++}
++
++}  // namespace
++
++TEST_CASE("guard band: a frame that stays near the screen is passed through") {
++    Frame f;
++    f.vertices = {vtx(-500, -500, 0.01f, 0, 0, 0), vtx(900, 10, 0.01f, 1, 0, 0), vtx(10, 900, 0.01f, 0, 1, 0)};
++    Polygon p;
++    p.count = 3;
++    f.lists[0].push_back(p);
++    Frame scratch;
++    std::uint32_t cut = 99;
++    const GuardBand band;
++    const Frame& out = clip_to_guard_band(f, band, scratch, &cut);
++    CHECK(&out == &f);
++    CHECK(cut == 0);
++}
++
++TEST_CASE("guard band: cutting changes nothing inside the band") {
++    const Frame f = far_strip();
++    Frame scratch;
++    std::uint32_t cut = 0;
++    const GuardBand band;
++    const Frame& out = clip_to_guard_band(f, band, scratch, &cut);
++    REQUIRE(&out == &scratch);
++    CHECK(cut == 1);
++    for (const Vertex& v : out.vertices)
++        if (&v >= &out.vertices[f.vertices.size()]) {
++            CHECK(v.x >= band.left - band.margin - 0.01f);
++            CHECK(v.y >= band.top - band.margin - 0.01f);
++            CHECK(v.x <= band.right + band.margin + 0.01f);
++            CHECK(v.y <= band.bottom + band.margin + 0.01f);
++        }
++    // Every pixel the original covers on screen: the pieces cover it with the same values.
++    int covered = 0;
++    for (int y = 0; y < 480; y += 3)
++        for (int x = 0; x < 640; x += 3) {
++            const Sample want = sample_frame(f, f.lists[0][0], x + 0.5, y + 0.5);
++            Sample got;
++            for (const Polygon& q : out.lists[0]) {
++                got = sample_frame(out, q, x + 0.5, y + 0.5);
++                if (got.hit)
++                    break;
++            }
++            REQUIRE(want.hit == got.hit);
++            if (!want.hit)
++                continue;
++            ++covered;
++            CHECK(std::fabs(got.z - want.z) <= 1e-9 + 1e-6 * want.z);
++            CHECK(std::fabs(got.u - want.u) <= 1e-3);
++            CHECK(std::fabs(got.v - want.v) <= 1e-3);
++            CHECK(std::fabs(got.red - want.red) <= 1.0);  // colours are rounded to 8 bits
++        }
++    CHECK(covered > 100);
++}
++
++TEST_CASE("guard band: each piece faces the way its triangle did") {
++    const Frame f = far_strip();
++    Frame scratch;
++    const GuardBand band;
++    const Frame& out = clip_to_guard_band(f, band, scratch);
++    // Triangle 0 of the strip as drawn, and triangle 1 with the strip's swap undone.
++    const auto& v = f.vertices;
++    const double faces[2] = {area(v[0], v[1], v[2]), area(v[1], v[3], v[2])};
++    REQUIRE(!out.lists[0].empty());
++    for (const Polygon& q : out.lists[0]) {
++        REQUIRE(q.count == 3);
++        CHECK(q.isp == 0x93000000u);
++        CHECK(q.tcw == 0x88070368u);
++        const double a = area(out.vertices[q.first], out.vertices[q.first + 1], out.vertices[q.first + 2]);
++        CHECK(a != 0.0);
++        // Both triangles of this strip face the same way once the swap is undone.
++        CHECK((a > 0) == (faces[0] > 0));
++    }
++    CHECK((faces[0] > 0) == (faces[1] > 0));
++}
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 40617e9..672aaba 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -657,6 +657,23 @@ struct Live {
+                             static_cast<double>(guest_cycles) / 200e6);
+             }
+         }
++        // CT2-nx: CT2_CLIP_AB=N turns the guard band cut (render/guard_band.h) off and on in turn
++        // every N seconds of game time, logged and on the FPS counter. Without it the cut is on.
++        if (clip_ab_s_ < 0) {
++            const char* ab = std::getenv("CT2_CLIP_AB");
++            clip_ab_s_ = ab ? std::max(0, std::atoi(ab)) : 0;
++            if (clip_ab_s_)
++                std::printf("clip a/b: off and on in turn, %d s each\n", clip_ab_s_);
++        }
++        if (clip_ab_s_ > 0) {
++            const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / clip_ab_s_);
++            const int on = (slot + 1) % 2;  // on first, then off
++            if (on != clip_ab_mode_.load()) {
++                clip_ab_mode_.store(on);
++                std::printf("clip a/b: %s from %.1f s\n", on ? "CLIP ON" : "CLIP OFF",
++                            static_cast<double>(guest_cycles) / 200e6);
++            }
++        }
+         // CT2-nx: CT2_CAPTURE_EVERY=N writes a capture (as F11 does) every N seconds of game time,
+         // so a flicker on screen leaves frames to render again offline without a key press.
+         if (capture_every_s_ < 0) {
+@@ -848,13 +865,14 @@ struct Live {
+     // the GPU (Presenter::overlay). The translucent panel the CPU path blends is opaque here,
+     // since the pixels underneath are not on the CPU to blend with.
+     void draw_counter_tile(std::uint32_t frame_width) {
+-        char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s", fps_shown, speed_shown,
++        char line[96];
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s%s", fps_shown, speed_shown,
+                       present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
+                       translucency_ab_mode_.load() >= 0 ? "  " : "",
+                       translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "",
+                       depth_ab_mode_.load() >= 0 ? "  " : "",
+-                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "");
++                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "",
++                      clip_ab_mode_.load() < 0 ? "" : clip_ab_mode_.load() ? "  CLIP ON" : "  CLIP OFF");
+         dream::render::TextStyle style;
+         style.scale = std::max(2u, 2u * (frame_width / kGuestWidth));
+         style.bg = 0;
+@@ -980,6 +998,7 @@ struct Live {
+         off_->lean_oit = mode == 2;
+         renderer.sort_triangles = mode == 3;
+         renderer.depth_variant = std::max(0, depth_ab_mode_.load());
++        off_->guard_band = clip_ab_mode_.load() != 0;  // CT2-nx: on unless the a/b has it off
+         const int here = in_game ? 2 : charsel ? 1 : 0;
+         if (here != menu_logged_) {
+             menu_logged_ = here;
+@@ -1309,13 +1328,14 @@ struct Live {
+     // Drawn into the frame the presenter is about to upload, so its size follows --scale and it
+     // stays the same size relative to the picture however the window is resized.
+     void draw_counter(std::uint32_t* px, std::uint32_t w, std::uint32_t h) {
+-        char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s", fps_shown, speed_shown,
++        char line[96];
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s%s%s%s", fps_shown, speed_shown,
+                       present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
+                       translucency_ab_mode_.load() >= 0 ? "  " : "",
+                       translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "",
+                       depth_ab_mode_.load() >= 0 ? "  " : "",
+-                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "");
++                      depth_ab_mode_.load() >= 0 ? depth_label(depth_ab_mode_.load()) : "",
++                      clip_ab_mode_.load() < 0 ? "" : clip_ab_mode_.load() ? "  CLIP ON" : "  CLIP OFF");
+         dream::render::TextStyle style;
+         // One text pixel per two guest pixels at --scale 1, and the same apparent size at every
+         // scale above it, so the counter neither disappears nor swamps the picture.
+@@ -1413,6 +1433,8 @@ struct Live {
+             std::fprintf(f, "display: %s\n", shown.describe().c_str());
+             std::fprintf(f, "source: %s\n", from_renderer ? "the renderer" : "video memory");
+             std::fprintf(f, "parameter words: %zu\n", last_stream.size());
++            std::fprintf(f, "guard band cut: %s, %u strips cut\n",  // CT2-nx
++                         off_->guard_band ? "on" : "off", off_->last_cut);
+             std::fclose(f);
+         }
+         std::printf("captured %s.{ppm,ta,vram,vram.regs,txt} at guest frame %llu\n", stem,
+@@ -1481,6 +1503,8 @@ struct Live {
+     std::atomic<int> depth_ab_mode_{-1};  // CT2-nx: Renderer::depth_variant from the a/b
+     int capture_every_s_ = -1;       // CT2-nx: CT2_CAPTURE_EVERY seconds, 0 off, -1 not read yet
+     std::uint64_t capture_slot_ = ~0ull;
++    int clip_ab_s_ = -1;             // CT2-nx: CT2_CLIP_AB seconds, 0 off, -1 not read yet
++    std::atomic<int> clip_ab_mode_{-1};  // CT2-nx: 1 cut on, 0 off, -1 no a/b (on)
+     bool capture_due_ = false;
+     static const char* depth_label(int v) {
+         return v == 1 ? "DEPTH TIE BIAS" : v == 2 ? "DEPTH ROUNDED" : "DEPTH AS IS";

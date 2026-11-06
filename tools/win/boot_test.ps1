@@ -3,7 +3,7 @@
 #   out\logs\boot.log          everything the launcher printed
 #   out\logs\boot-report.txt   where the run got to and why it stopped
 #   out\logs\suggested.toml    code the run reached that is not translated yet (Claude merges it)
-#   powershell -ExecutionPolicy Bypass -File tools\win\boot_test.ps1 [-Seconds 120] [-Headless] [-PresentAB 15] [-TranslucencyAB 10] [-DepthAB 10] [-CaptureEvery 20] [-RenderOnGameThread]
+#   powershell -ExecutionPolicy Bypass -File tools\win\boot_test.ps1 [-Seconds 120] [-Headless] [-PresentAB 15] [-TranslucencyAB 10] [-DepthAB 10] [-CaptureEvery 20] [-ClipAB 10] [-RenderOnGameThread]
 #   -RenderOnGameThread: draw on the game thread as each render starts (DREAM_RENDER_THREAD=0),
 #   so textures are read from video memory as the game left it at that moment.
 #   -PresentAB N: every N game seconds, switch between showing frames without waiting for the one
@@ -13,7 +13,10 @@
 #   per strip; patch 0036), shown on the FPS counter. F11 writes a capture-NNN.* set to C:\CT2-nx.
 #   -DepthAB N: every N game seconds, the next way of writing depth (as computed, tie bias,
 #   rounded; patch 0037), shown on the FPS counter. -CaptureEvery N: a capture every N game seconds.
-param([int]$Seconds = 120, [switch]$Headless, [int]$PresentAB = 0, [int]$TranslucencyAB = 0, [int]$DepthAB = 0, [int]$CaptureEvery = 0, [switch]$RenderOnGameThread, [string]$Game = 'crazytaxi2')
+#   -ClipAB N: every N game seconds, the guard band cut (patch 0038: polygons reaching far off
+#   screen cut down before the GPU draws them) on, then off; the FPS counter shows CLIP ON or
+#   CLIP OFF, and each capture's .txt says which. Without it the cut is always on.
+param([int]$Seconds = 120, [switch]$Headless, [int]$PresentAB = 0, [int]$TranslucencyAB = 0, [int]$DepthAB = 0, [int]$CaptureEvery = 0, [int]$ClipAB = 0, [switch]$RenderOnGameThread, [string]$Game = 'crazytaxi2')
 . "$PSScriptRoot\common.ps1"
 if (-not (Test-Path $GameExe)) { throw 'Not built yet. Run tools\win\build_pc.ps1 first.' }
 Start-Log 'boot.log' "boot_test $GameId $Seconds s" | Out-Null
@@ -37,6 +40,7 @@ if ($PresentAB -gt 0) { $env:CT2_PRESENT_AB = "$PresentAB" } else { Remove-Item 
 if ($RenderOnGameThread) { $env:DREAM_RENDER_THREAD = '0' } else { Remove-Item Env:DREAM_RENDER_THREAD -ErrorAction SilentlyContinue }
 if ($DepthAB -gt 0) { $env:CT2_DEPTH_AB = "$DepthAB" } else { Remove-Item Env:CT2_DEPTH_AB -ErrorAction SilentlyContinue }
 if ($CaptureEvery -gt 0) { $env:CT2_CAPTURE_EVERY = "$CaptureEvery" } else { Remove-Item Env:CT2_CAPTURE_EVERY -ErrorAction SilentlyContinue }
+if ($ClipAB -gt 0) { $env:CT2_CLIP_AB = "$ClipAB" } else { Remove-Item Env:CT2_CLIP_AB -ErrorAction SilentlyContinue }
 if ($TranslucencyAB -gt 0) { $env:CT2_TRANSLUCENCY_AB = "$TranslucencyAB" } else { Remove-Item Env:CT2_TRANSLUCENCY_AB -ErrorAction SilentlyContinue }
 Write-Host "Booting $GameId for up to $Seconds game seconds (more in real time while it runs slow) ..."
 $rc = Invoke-Logged $GameExe $a 'boot' '^frame'

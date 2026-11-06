@@ -2,6 +2,40 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: not a texture race; huge off-screen polygons; guard band cut (patch 0038)
+
+- Mark: with -RenderOnGameThread the flicker is still there. So the texture race is ruled out.
+  The log: 862 textures decoded, 0 failed, so the cache is not short of descriptor sets either.
+  Ten captures (015 to 024) were taken half a second apart, with the taxi parked.
+- The flicker in these captures: at the top left, the light stone band of the near building is
+  missing in 016, 019 and 020. The blue-grey surface showing in its place is texture c8075030
+  (sky clouds, a reflection on the glass building behind). The stone is texture 88070368.
+  Redrawn offline (rcap, llvmpipe), all four captures show the stone. The same input with the
+  same renderer code: only the GPU differs.
+- At pixel (97,72), the stone strip (L0 #1970) is 0.5% nearer than the clouds strip (#1983)
+  (zprobe: exact 1/w per triangle in double). Both strips have corners near the camera
+  (1/w 3.33, the game's near plane) with screen coordinates up to x -190,000 and y -2,000,000.
+- Across the four captures, 97 to 99% of the pixels where the game's frame differs from the
+  redraw have one of those huge strips as the exact nearest surface (attrib tool). Among the
+  pixels that agree, about 48% do. The GPU computes depth across those triangles from the far
+  corners in single precision and gets near-equal surfaces wrong. The road and its painted lines
+  are the same case.
+- Patch 0038, render/guard_band.{h,cpp}: Offscreen::render cuts every strip with a vertex more
+  than 1024 guest pixels off screen into its triangles, clipped to 256 pixels around the screen
+  (Sutherland-Hodgman in double precision). x, y, 1/w and the attributes times 1/w are linear in
+  screen space, so the cut is exact. The winding of each triangle is kept, odd triangles of a
+  strip included. Strips that stay within reach are untouched; frames with nothing to cut are not
+  copied. Unit test render/tests/test_guard_band.cpp (40,103 assertions; the same values at every
+  covered pixel, the winding kept, passthrough). rcap redraws of 015, 016, 019 and 020 with the
+  cut: no pixel changes by more than 4 (of 765), from rounding.
+- CT2_CLIP_AB=N (boot_test.ps1 -ClipAB N) turns the cut on, then off, every N game seconds,
+  shown as CLIP ON or CLIP OFF on the FPS counter. Each capture's .txt now records the cut's
+  state and how many strips it cut. Without the a/b the cut is on.
+- Unknown: whether the Switch GPU shows the flicker without the cut. The cut stays either way.
+- Pitfall: I read "offline redraw right, game wrong" as a race in the game's own state, when
+  the GPU itself was the other difference. Check the input for extreme values before blaming
+  timing.
+
 ## 2026-11-06: depth A/B result; the flicker is a texture race, not depth
 
 - Mark: no change in any depth variant. 15 captures; 005 to 014 at a building where the flicker
