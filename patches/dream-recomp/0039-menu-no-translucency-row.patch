@@ -1,0 +1,73 @@
+diff --git a/render/include/dream/render/port_menu.h b/render/include/dream/render/port_menu.h
+index f30c9ee..2d21f18 100644
+--- a/render/include/dream/render/port_menu.h
++++ b/render/include/dream/render/port_menu.h
+@@ -110,6 +110,8 @@ private:
+             return show_snapshot;
+         if (row == kPacing)
+             return false;  // CTDC-nx: no frame pacing choice (see PortOptions::pacing)
++        if (row == kTranslucency)
++            return false;  // CT2-nx: per triangle always (Mark, 2026-11-06)
+         return (row != kCpu && row != kGpu && row != kMem) || clock_;
+     }
+ 
+diff --git a/render/tests/test_port_menu.cpp b/render/tests/test_port_menu.cpp
+index b9ced49..9f48ead 100644
+--- a/render/tests/test_port_menu.cpp
++++ b/render/tests/test_port_menu.cpp
+@@ -39,7 +39,7 @@ TEST_CASE("port menu: moving, changing and closing") {
+     PortOptions o;
+     m.open(o, /*can_set_clock=*/false);
+     CHECK(m.is_open());
+-    // Resume, Controls, FPS, Screen, Volume, Translucency, (CPU and GPU hidden), Quit.
++    // Resume, Controls, FPS, Screen, Volume, Resolution, (translucency, CPU and GPU hidden), Quit.
+     m.move(1);
+     m.move(1);  // SHOW FPS
+     CHECK(m.activate() == PortMenu::Action::None);
+@@ -49,16 +49,8 @@ TEST_CASE("port menu: moving, changing and closing") {
+     m.move(1);  // VOLUME
+     m.adjust(-1);
+     CHECK(m.options().volume == 90);
+-    m.move(1);  // TRANSLUCENCY: accurate, triangle, strip, then round again (default triangle)
++    // CT2-nx: TRANSLUCENCY is hidden (always per triangle); the options file still parses it.
+     CHECK(m.options().translucency == 3);
+-    CHECK(m.activate() == PortMenu::Action::None);
+-    CHECK(m.options().translucency == 1);
+-    m.adjust(1);
+-    CHECK(m.options().translucency == 0);
+-    m.adjust(1);
+-    CHECK(m.options().translucency == 3);
+-    m.adjust(-1);
+-    CHECK(m.options().translucency == 0);
+     CHECK(PortOptions::from_text("TRANSLUCENCY=lean\n").translucency == 0);  // no longer offered
+     CHECK(PortOptions::from_text("TRANSLUCENCY=triangle\n").translucency == 3);
+     CHECK(PortOptions::from_text("TRANSLUCENCY=fast\n").translucency == 1);
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 672aaba..fb3abab 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -992,7 +992,10 @@ struct Live {
+         (void)frame;
+         const bool accurate_here = in_game || charsel;
+         const int ab_mode = translucency_ab_mode_.load();
+-        const int mode = ab_mode >= 0 ? ab_mode : accurate_here ? options.translucency : 3;
++        // CT2-nx: the menu has no translucency row, so an options file that still names a mode
++        // does not pick one either: per triangle everywhere, unless the a/b is cycling them.
++        (void)accurate_here;
++        const int mode = ab_mode >= 0 ? ab_mode : 3;
+         const bool per_pixel = mode == 0 || mode == 2;
+         off_->allow_oit = per_pixel;
+         off_->lean_oit = mode == 2;
+@@ -1002,10 +1005,8 @@ struct Live {
+         const int here = in_game ? 2 : charsel ? 1 : 0;
+         if (here != menu_logged_) {
+             menu_logged_ = here;
+-            std::printf("translucency here: %s\n",
+-                        here == 2   ? "the menu's choice (play)"
+-                        : here == 1 ? "the menu's choice (character select)"
+-                                    : "per triangle (title and menus)");
++            std::printf("translucency here: per triangle (%s)\n",  // CT2-nx
++                        here == 2 ? "play" : here == 1 ? "character select" : "title and menus");
+         }
+     }
+ 

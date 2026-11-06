@@ -2,6 +2,20 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: guard band cut confirmed on the PC; port menu for the Switch (patch 0039)
+
+- Mark, -ClipAB 10: "it worked". The flicker is gone with the cut on, and back with it off. Log:
+  10 a/b switches, 59 to 60 fps, 0 untranslated targets. Captures with the cut on cut 73 to
+  106 strips; with it off, 0.
+- Mark's port menu for CT2: keep the resolution scaler and the clocks, drop the translucency
+  option, header CRAZY TAXI 2 (already so since patch 0026). Patch 0039 hides the translucency
+  row and draws translucency per triangle everywhere, whatever an options file says (the a/b
+  still cycles them on the PC). test_port_menu.cpp updated (39 assertions pass).
+- Resolution: --whole-game (patch 0033) applies the menu's 1x, 1.5x and 2x on every screen, so
+  the module check (Sonic Adventure's) does not decide it. Clocks: the Switch layer's CPU, GPU
+  and memory rows, first run CPU 1224 MHz, as in CTDC-nx.
+- Next: switch-test1, the first Switch NRO, built in the cloud.
+
 ## 2026-11-06: not a texture race; huge off-screen polygons; guard band cut (patch 0038)
 
 - Mark: with -RenderOnGameThread the flicker is still there. So the texture race is ruled out.
