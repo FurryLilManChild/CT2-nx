@@ -1,0 +1,93 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index 77ac321..2a72857 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -619,6 +619,26 @@ struct Live {
+                 std::printf("present a/b: wait and no-wait alternate every %d s of game time\n",
+                             present_ab_s_);
+         }
++        // CT2-nx: CT2_TRANSLUCENCY_AB=N cycles the translucency mode every N seconds of game time
++        // (per triangle, accurate per pixel, per strip), logs each change and puts it on the FPS
++        // counter: for ground textures that flicker in play (2026-11-06), on the same screen.
++        if (translucency_ab_s_ < 0) {
++            const char* ab = std::getenv("CT2_TRANSLUCENCY_AB");
++            translucency_ab_s_ = ab ? std::max(0, std::atoi(ab)) : 0;
++            if (translucency_ab_s_)
++                std::printf("translucency a/b: per triangle, per pixel and per strip in turn, %d s "
++                            "each\n", translucency_ab_s_);
++        }
++        if (translucency_ab_s_ > 0) {
++            static constexpr int kModes[3] = {3, 0, 1};
++            const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / translucency_ab_s_);
++            const int mode = kModes[slot % 3];
++            if (mode != translucency_ab_mode_.load()) {
++                translucency_ab_mode_.store(mode);
++                std::printf("translucency a/b: %s from %.1f s\n", translucency_label(mode),
++                            static_cast<double>(guest_cycles) / 200e6);
++            }
++        }
+         bool ab_wait = false;
+         if (present_ab_s_ > 0) {
+             const int slot = static_cast<int>(static_cast<double>(guest_cycles) / 200e6 / present_ab_s_);
+@@ -630,8 +650,11 @@ struct Live {
+                 present_ab_logged_ = true;
+             }
+         }
+-        const bool no_wait = render_threaded && gpu_present && !paused() && !menu.is_open() &&
+-                             !port.is_open() && !target_switched_ && !ab_wait &&
++        // CT2-nx: waiting is the default (Mark, 2026-11-06 PC A/B: motion looked clearly better
++        // with WAIT). No-wait only with CT2_NO_WAIT set, or in the a/b's NO WAIT stretches.
++        const bool no_wait_on = present_ab_s_ > 0 || std::getenv("CT2_NO_WAIT") != nullptr;
++        const bool no_wait = no_wait_on && render_threaded && gpu_present && !paused() &&
++                             !menu.is_open() && !port.is_open() && !target_switched_ && !ab_wait &&
+                              std::getenv("CTDC_WAIT") == nullptr;
+         bool unwaited = false;
+         if (no_wait && render_in_flight()) {
+@@ -793,8 +816,10 @@ struct Live {
+     // since the pixels underneath are not on the CPU to blend with.
+     void draw_counter_tile(std::uint32_t frame_width) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s", fps_shown, speed_shown,
+-                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "");
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s", fps_shown, speed_shown,
++                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
++                      translucency_ab_mode_.load() >= 0 ? "  " : "",
++                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "");
+         dream::render::TextStyle style;
+         style.scale = std::max(2u, 2u * (frame_width / kGuestWidth));
+         style.bg = 0;
+@@ -913,7 +938,8 @@ struct Live {
+     void choose_translucency(const dream::render::Frame& frame, bool in_game, bool charsel) {
+         (void)frame;
+         const bool accurate_here = in_game || charsel;
+-        const int mode = accurate_here ? options.translucency : 3;
++        const int ab_mode = translucency_ab_mode_.load();
++        const int mode = ab_mode >= 0 ? ab_mode : accurate_here ? options.translucency : 3;
+         const bool per_pixel = mode == 0 || mode == 2;
+         off_->allow_oit = per_pixel;
+         off_->lean_oit = mode == 2;
+@@ -1248,8 +1274,10 @@ struct Live {
+     // stays the same size relative to the picture however the window is resized.
+     void draw_counter(std::uint32_t* px, std::uint32_t w, std::uint32_t h) {
+         char line[64];
+-        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s", fps_shown, speed_shown,
+-                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "");
++        std::snprintf(line, sizeof line, "%.1f FPS  %.2fX%s%s%s", fps_shown, speed_shown,
++                      present_ab_s_ > 0 ? (present_ab_wait_ ? "  WAIT" : "  NO WAIT") : "",
++                      translucency_ab_mode_.load() >= 0 ? "  " : "",
++                      translucency_ab_mode_.load() >= 0 ? translucency_label(translucency_ab_mode_.load()) : "");
+         dream::render::TextStyle style;
+         // One text pixel per two guest pixels at --scale 1, and the same apparent size at every
+         // scale above it, so the counter neither disappears nor swamps the picture.
+@@ -1409,6 +1437,11 @@ struct Live {
+     int menu_logged_ = -1, logged_translucency_ = -1;
+     std::uint64_t presents_unwaited = 0, perf_unwaited_at = 0;  // CTDC-nx: no-wait presents
+     int present_ab_s_ = -1;          // CT2-nx: CT2_PRESENT_AB seconds, 0 off, -1 not read yet
++    int translucency_ab_s_ = -1;     // CT2-nx: CT2_TRANSLUCENCY_AB seconds, 0 off, -1 not read yet
++    std::atomic<int> translucency_ab_mode_{-1};  // CT2-nx: the a/b's mode now (read on the render thread)
++    static const char* translucency_label(int mode) {
++        return mode == 0 ? "PER PIXEL" : mode == 1 ? "PER STRIP" : mode == 2 ? "PER PIXEL LEAN" : "PER TRIANGLE";
++    }
+     bool present_ab_wait_ = false, present_ab_logged_ = false;  // CT2-nx: the current a/b mode
+     bool target_switched_ = false;  // CTDC-nx: set when off_ changes, until a present waited
+     std::uint64_t presents_skipped = 0, perf_skipped_at = 0, pacing_rebased = 0;  // SA-nx: refreshes left on the last finished frame

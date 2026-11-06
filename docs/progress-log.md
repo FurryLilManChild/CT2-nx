@@ -2,6 +2,21 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: present A/B result; ground flicker next
+
+- Second PC boot test (998 s build, 144 guest s, `-PresentAB 15`): untranslated call targets 0
+  (the seeds and the stub relocations at 0x8C000000 took everything); loading now 0.92x to 0.99x;
+  play at 0.97x to 1.00x, 59.9 fps shown, game thread 41 to 51% busy.
+- Mark: WAIT is clearly the better of the two. The jitter he reported was mostly something else:
+  textures flickering on the ground (while picking up a fare), in both WAIT and NO WAIT.
+- Unmapped accesses: 5 single reads at boot (0xA0600000/4 and 0xA1000400/800/1400), the G2 bus
+  where a modem or network adapter would answer: the game looking for its online hardware.
+- Patch 0036: waiting is the default; no-wait only with CT2_NO_WAIT (or inside the present a/b).
+  CT2_TRANSLUCENCY_AB=N (boot_test.ps1 -TranslucencyAB N) cycles per triangle, per pixel and per
+  strip every N game seconds, logged and on the FPS counter. If the flicker follows the mode, it is
+  translucent sorting; if it is there in all three, it is something else (depth fighting between
+  ground polygons, or a texture), and an F11 capture at the spot can be rendered offline here.
+
 ## 2026-11-06: first PC boot test; jitter A/B next
 
 - Built in 1,020 s (90 files from the patch set). Boot test, 120 guest s: title, menus and into
