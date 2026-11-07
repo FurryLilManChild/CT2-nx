@@ -1,0 +1,109 @@
+diff --git a/render/include/dream/render/vk/offscreen.h b/render/include/dream/render/vk/offscreen.h
+index 782b057..db37a19 100644
+--- a/render/include/dream/render/vk/offscreen.h
++++ b/render/include/dream/render/vk/offscreen.h
+@@ -99,6 +99,7 @@ public:
+     // how many the last render cut.
+     bool guard_band = true;
+     std::uint32_t last_cut = 0;
++    std::uint64_t cut_ns = 0;  // CT2-nx (switch-test2): time spent cutting, all renders so far
+     // SA-nx: switches for the capture replayer (switch/replay), to find what makes the per-pixel
+     // pass slow on the Switch. All off in the game.
+     struct Experiment {
+diff --git a/render/src/vk/offscreen.cpp b/render/src/vk/offscreen.cpp
+index 794e942..62d4918 100644
+--- a/render/src/vk/offscreen.cpp
++++ b/render/src/vk/offscreen.cpp
+@@ -462,8 +462,12 @@ bool Offscreen::render(Renderer& renderer, const Frame& frame_in, const FrameGeo
+     band.top = geometry.top;
+     band.right = geometry.left + geometry.width;
+     band.bottom = geometry.top + geometry.height;
++    const auto cut_from = std::chrono::steady_clock::now();
+     const Frame& frame =
+         guard_band ? clip_to_guard_band(frame_in, band, guard_frame_, &last_cut) : frame_in;
++    cut_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                             std::chrono::steady_clock::now() - cut_from)
++                                             .count());
+     vkResetCommandBuffer(cmd_, 0);
+     VkCommandBufferBeginInfo bi{};
+     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index fb3abab..ad64fa5 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -302,7 +302,12 @@ struct Live {
+             if (dream::render::add_background(decoder.frame(), job_regs_.data(), memory_.vram(),
+                                               dream::mem::DcMemory::kVramSize))
+                 ++job_backgrounds_;
++            const auto decoded = std::chrono::steady_clock::now();  // CT2-nx: phase times
++            rt_decode_ns += ns_since(from);
+             off_->finish();  // before a texture the last render read can be dropped
++            rt_finish_ns += ns_since(decoded);
++            const std::uint64_t cut_before = off_->cut_ns;
++            const auto drawing = std::chrono::steady_clock::now();
+             choose_translucency(decoder.frame(), job_in_game_, job_charsel_);
+             if (renderer.textures().set_palette(job_palette_.data(), job_palette_format_))
+                 ++job_palette_changes_;
+@@ -310,6 +315,9 @@ struct Live {
+             for (const auto& [begin, end] : job_ranges_)
+                 job_invalidated_ += renderer.textures().invalidate_range(begin, end);
+             const bool ok = off_->render(renderer, decoder.frame(), geometry);
++            rt_cut_ns += off_->cut_ns - cut_before;
++            rt_draw_ns += ns_since(drawing) - (off_->cut_ns - cut_before);
++            ++rt_jobs_;
+             render_thread_ns += ns_since(from);
+             {
+                 std::lock_guard<std::mutex> lock(render_mu_);
+@@ -471,6 +479,23 @@ struct Live {
+                         static_cast<double>(rendered - perf_rendered_at) / wall, speed,
+                         pct(game_ms), pct(audio_ms), pct(render_ms), pct(present_ms), pct(gpu_ms),
+                         pct(sleep_ms), pct(paused_ms));
++        // CT2-nx (switch-test2): where the render thread's time goes, per render. Draw is texture
++        // decoding, building the vertex data and recording and submitting the GPU work.
++        if (render_threaded && rt_jobs_.load() != rt_jobs_at_) {
++            const double n = static_cast<double>(rt_jobs_.load() - rt_jobs_at_);
++            const auto per = [n](std::uint64_t ns, std::uint64_t at) {
++                return static_cast<double>(ns - at) / 1e6 / n;
++            };
++            std::printf("render thread per render: decode %.2f ms, gpu wait %.2f ms, guard band "
++                        "%.2f ms, draw %.2f ms\n",
++                        per(rt_decode_ns.load(), rt_decode_at_), per(rt_finish_ns.load(), rt_finish_at_),
++                        per(rt_cut_ns.load(), rt_cut_at_), per(rt_draw_ns.load(), rt_draw_at_));
++        }
++        rt_jobs_at_ = rt_jobs_.load();
++        rt_decode_at_ = rt_decode_ns.load();
++        rt_finish_at_ = rt_finish_ns.load();
++        rt_cut_at_ = rt_cut_ns.load();
++        rt_draw_at_ = rt_draw_ns.load();
+         // ZombieRev-nx: the clocks every perf line ran at, so each reading is tied to one.
+         if (dream_port_cpu_mhz)
+             std::printf("clock: CPU %d MHz, GPU %d MHz, memory %d MHz\n", dream_port_cpu_mhz,
+@@ -701,7 +726,15 @@ struct Live {
+         }
+         // CT2-nx: waiting is the default (Mark, 2026-11-06 PC A/B: motion looked clearly better
+         // with WAIT). No-wait only with CT2_NO_WAIT set, or in the a/b's NO WAIT stretches.
+-        const bool no_wait_on = present_ab_s_ > 0 || std::getenv("CT2_NO_WAIT") != nullptr;
++        // CT2-nx (switch-test2): on the Switch, no-wait as in CTDC-nx (Mark, 2026-11-06: test1 lost
++        // about 30% of the game thread to this wait at 1224 MHz). The PC keeps waiting.
++#ifdef __SWITCH__
++        constexpr bool kNoWaitHere = true;
++#else
++        constexpr bool kNoWaitHere = false;
++#endif
++        const bool no_wait_on =
++            kNoWaitHere || present_ab_s_ > 0 || std::getenv("CT2_NO_WAIT") != nullptr;
+         const bool no_wait = no_wait_on && render_threaded && gpu_present && !paused() &&
+                              !menu.is_open() && !port.is_open() && !target_switched_ && !ab_wait &&
+                              std::getenv("CTDC_WAIT") == nullptr;
+@@ -1519,6 +1552,11 @@ struct Live {
+     static constexpr std::size_t kJobRegWords = 0x200 / 4;  // the background plane's registers
+     std::vector<std::uint32_t> job_regs_;
+     std::atomic<std::uint64_t> render_thread_ns{0};
++    // CT2-nx (switch-test2): the render thread's time by phase, and the perf line's marks.
++    std::atomic<std::uint64_t> rt_decode_ns{0}, rt_finish_ns{0}, rt_cut_ns{0}, rt_draw_ns{0},
++        rt_jobs_{0};
++    std::uint64_t rt_decode_at_ = 0, rt_finish_at_ = 0, rt_cut_at_ = 0, rt_draw_at_ = 0,
++                  rt_jobs_at_ = 0;
+     std::uint64_t render_wait_ns = 0, render_thread_at = 0;
+     std::uint32_t target_address = 0;
+     std::uint64_t guest_frame = 0;

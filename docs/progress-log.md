@@ -2,6 +2,24 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: switch-test1 results; switch-test2 (patch 0040)
+
+- switch-test1 (NRO sha256 2a187d62de65d25f209cae9c23a63d4e3a21e5b3cc3a5b49957ebd4541ec863b,
+  130 steps, verified on Mark's PC): boots, plays, no crash, no flicker, 1 memory card save,
+  0 untranslated targets. Mark: not fully smooth at 1x until CPU, GPU and memory were all raised.
+- Log: at CPU 1224, GPU 307, memory 1331 MHz, heavy driving ran 0.75x to 0.82x with game 62 to
+  65%, sleep 0, and the game thread waiting 29 to 31% for the render thread (busy 40%). CPU
+  1785: 0.86x to 1.00x, waiting 15 to 27%. All three raised: mostly 1.00x. GPU 1.2 to 2.8 ms a
+  render. Profile, slow samples: 4,074 of 8,510 in render_wait under present.
+- Cause: the WAIT present (patch 0036, Mark's PC choice). CTDC-nx has been no-wait on the Switch
+  since switch-test6 (patch 0027), which I added from the same kind of profile; Mark never chose
+  it as such, and he asked me to check before building. Mark: CT2 will very likely behave as CT1,
+  so make the Switch no-wait and confirm by playing rather than with an a/b.
+- Patch 0040: no-wait on the Switch (the PC still waits); a perf line "render thread per
+  render" with decode, gpu wait, guard band and draw times.
+- switch-test2 checks: speed at 1224 MHz with GPU and memory at stock, a stretch at 1020 MHz,
+  resolution 1.5x and 2x, and any network option in the menus (2_DP.BIN is not configured).
+
 ## 2026-11-06: guard band cut confirmed on the PC; port menu for the Switch (patch 0039)
 
 - Mark, -ClipAB 10: "it worked". The flicker is gone with the cut on, and back with it off. Log:
