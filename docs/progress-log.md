@@ -2,6 +2,17 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: switch-test3 results; default clock 1224 MHz
+
+- switch-test3 (NRO sha256 529838880a20cf3c4ad18c04398edcdc9d53fa096914452d64b522af933c6704,
+  96 steps, verified on Mark's PC). Mark: very smooth at 1224 MHz and 1x; he chose 1224 MHz as
+  the default (what a fresh install already writes).
+- Log: 1224/307/1331 MHz, 1x busy driving 0.96x to 1.00x with 6 to 15% sleep left (test2: 0.95x
+  to 1.00x, 0 to 11%). 1.5x at 1224: 0.90x to 1.00x. Stock: 0.89x to 0.99x (test2 0.86x to
+  0.96x). One dip each to about 0.7x to 0.8x right before a menu or resolution change.
+- Non-local returns: 176,105 straight to run_guest, 10,467 thrown (94% take the fast path). No
+  crash, 0 untranslated targets. Disc worker at priority 58.
+
 ## 2026-11-06: switch-test2 results; switch-test3 (patch 0041)
 
 - switch-test2 (NRO sha256 a5f456f279f0fa8b4f5d66863b2e0e400f99d9c6f457ff550a4391b3920e0c27,

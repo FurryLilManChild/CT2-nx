@@ -704,8 +704,9 @@ int main(int argc, char** argv) {
         }
     };
     // The first run starts with the CPU at 1224 MHz, the smallest step above the system clock.
-    // That held Crazy Taxi at about full speed (CTDC-nx switch-test10); Crazy Taxi 2 is not yet
-    // measured on the Switch. The port menu can set it back to the system clock.
+    // That held Crazy Taxi at about full speed (CTDC-nx switch-test10), and Crazy Taxi 2 too from
+    // switch-test3 (Mark, 2026-11-06: very smooth at 1224 MHz and 1x; his choice of default). The
+    // port menu can set it back to the system clock.
     if (!exists("sdmc:/switch/crazytaxi2/crazytaxi2_options.txt")) {
         if (FILE* f = std::fopen("sdmc:/switch/crazytaxi2/crazytaxi2_options.txt", "wb")) {
             std::fputs("CPU_MHZ=1224\n", f);
