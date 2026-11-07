@@ -691,6 +691,17 @@ int main(int argc, char** argv) {
             return;
         const Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
         std::printf("[switch] thread %s on core %d%s\n", name, core, R_FAILED(rc) ? " (refused)" : "");
+        // switch-test3: the disc worker one step above the sound processor it shares core 2 with,
+        // so a read the game is waiting for starts at once rather than after the sound
+        // processor's time slice (the sound has its buffer to run on meanwhile).
+        if (!std::strcmp(name, "disc")) {
+            s32 prio = 0;
+            if (R_SUCCEEDED(svcGetThreadPriority(&prio, CUR_THREAD_HANDLE)) && prio > 0) {
+                const Result pr = svcSetThreadPriority(CUR_THREAD_HANDLE, static_cast<u32>(prio - 1));
+                std::printf("[switch] thread disc priority %d%s\n", prio - 1,
+                            R_FAILED(pr) ? " (refused)" : "");
+            }
+        }
     };
     // The first run starts with the CPU at 1224 MHz, the smallest step above the system clock.
     // That held Crazy Taxi at about full speed (CTDC-nx switch-test10); Crazy Taxi 2 is not yet

@@ -2,6 +2,30 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-06: switch-test2 results; switch-test3 (patch 0041)
+
+- switch-test2 (NRO sha256 a5f456f279f0fa8b4f5d66863b2e0e400f99d9c6f457ff550a4391b3920e0c27,
+  95 steps, verified on Mark's PC). No-wait took the game thread's wait for the render thread
+  from 29 to 31% to 0 to 3%. CPU 1224, GPU 307, memory 1331 MHz, 1x: 0.95x to 1.00x in busy
+  driving (test1 0.75x to 0.82x). 1.5x at 1224: 0.87x to 1.00x (GPU 4 to 5.5 ms a render). Stock
+  1020 MHz: 0.86x to 0.96x. Game thread 85 to 93% busy; render thread 45 to 60% on core 0
+  (decode 1.0 to 1.7 ms, guard band 0.4 to 0.7 ms, draw 5 to 8.6 ms a render). Mark did not try
+  2x (1.5x already short of full speed) and has no interest in the network options.
+- Profile, slow stretches: vertex loop fn_0c081260 19% and fn_0c080e82 6%; TA path (resolve,
+  sq_flush, Ta::feed, ch2_dma, write_burst) about 13%; C++ unwinding from nonlocal_return about
+  4% of stack samples (the game's longjmp at 0x0C095C58, its setjmp at 0x0C095CCC, from the
+  task code around 0x0C094C00); swapchain IPC about 3.4%; the CHD worker wait about 2%; the copy
+  of the TA stream in render_post about 1.6%.
+- Mark chose a small optimization build first, then the default clock from its numbers.
+- Patch 0041:
+  - nonlocal_return longjmps straight to the innermost run_guest when no frame that needs
+    unwinding is live (UnwindGuard in call_indirect's resume path and around every hook call);
+    otherwise it throws as before. The report counts both.
+  - CHD read-ahead 64 hunks (was 24).
+  - on_render takes the TA stream by reference and Live swaps it into last_stream (a second
+    render with no new parameter data keeps the words already taken).
+- switch_main: the disc worker one priority step above the sound processor on core 2.
+
 ## 2026-11-06: switch-test1 results; switch-test2 (patch 0040)
 
 - switch-test1 (NRO sha256 2a187d62de65d25f209cae9c23a63d4e3a21e5b3cc3a5b49957ebd4541ec863b,

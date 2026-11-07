@@ -1,0 +1,294 @@
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index ad64fa5..918f362 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -193,7 +193,7 @@ struct Live {
+ 
+     // The guest has handed the hardware a display list. Draw it, then put the result where the
+     // hardware would have put it.
+-    void render(const std::vector<std::uint32_t>& stream) {
++    void render(std::vector<std::uint32_t>& stream) {
+         const auto render_from = std::chrono::steady_clock::now();
+         struct Timed {  // SA-nx: counted however render() returns
+             std::chrono::steady_clock::time_point from;
+@@ -211,9 +211,9 @@ struct Live {
+         // SA-nx: the previous render may still be on the GPU (Offscreen::render no longer waits).
+         // Finish it before anything below can drop or replace a texture it is reading.
+         off_->finish();
+-        last_stream = stream;  // kept so F11 can write the list that drew what is on screen
++        take_stream(stream);  // kept so F11 can write the list that drew what is on screen
+         decoder.reset();
+-        decoder.feed_stream(stream.data(), stream.size());
++        decoder.feed_stream(last_stream.data(), last_stream.size());
+         // The plane the whole frame sits on is not in the stream: the title writes it into the
+         // parameter buffer and points a register at it. Without it the screen behind the geometry
+         // is whatever the renderer cleared to.
+@@ -265,8 +265,20 @@ struct Live {
+     // thread keeps the stream (last_stream, which nothing writes until the next render_post,
+     // after render_wait) and a copy of the registers the background plane reads; decoding was
+     // about 6% of the game thread at stock clocks (switch-test22 profile).
+-    void render_post(const std::vector<std::uint32_t>& stream) {
+-        last_stream = stream;
++    // CT2-nx (switch-test3): the display list's words move into last_stream instead of being
++    // copied (the copy was about 1.6% of the game thread in switch-test2's slow stretches). The
++    // TA's stream is left empty with last_stream's old capacity. A second render of the same list
++    // (no parameter data since the last one) keeps the words already taken.
++    void take_stream(std::vector<std::uint32_t>& stream) {
++        if (stream.empty() && pvr_.ta.chunks == taken_chunks_)
++            return;
++        last_stream.swap(stream);
++        stream.clear();
++        taken_chunks_ = pvr_.ta.chunks;
++    }
++
++    void render_post(std::vector<std::uint32_t>& stream) {
++        take_stream(stream);
+         job_regs_.assign(pvr_.reg_block(), pvr_.reg_block() + kJobRegWords);
+         job_in_game_ = in_game_ == 1 || !dynamic_scale;
+         job_charsel_ = !job_in_game_ && on_character_select();
+@@ -1561,6 +1573,7 @@ struct Live {
+     std::uint32_t target_address = 0;
+     std::uint64_t guest_frame = 0;
+     std::vector<std::uint32_t> last_stream;
++    std::uint64_t taken_chunks_ = ~0ull;  // CT2-nx: the TA's chunk count when last_stream was taken
+     unsigned screenshots = 0, captures = 0;
+     // The on-screen counter. Two numbers, because they answer different questions: how smooth it
+     // looks (frames actually presented per second of wall clock) and whether it is keeping up
+@@ -1673,6 +1686,13 @@ std::string report_text(dream::System& sys, dream::hle::Bios& bios, const dream:
+     std::snprintf(buf, sizeof buf, "task-switching RTEs: %llu\n",
+                   static_cast<unsigned long long>(sys.task_switch_rtes));
+     s += buf;
++    {
++        const auto nl = dream::sh4::nonlocal_stats();  // CT2-nx (switch-test3)
++        std::snprintf(buf, sizeof buf, "non-local returns: %llu straight to run_guest, %llu thrown\n",
++                      static_cast<unsigned long long>(nl.fast),
++                      static_cast<unsigned long long>(nl.thrown));
++        s += buf;
++    }
+     for (const auto& sw : sys.first_switches) {
+         std::snprintf(buf, sizeof buf, "  rte from pc 0x%08x sp 0x%08x -> pc 0x%08x sp 0x%08x\n",
+                       sw[0], sw[1], sw[2], sw[3]);
+@@ -2582,7 +2602,7 @@ int main(int argc, char** argv) {
+         // hidden files for asking for one.
+         bool one_shot_done = false;
+         pvr.on_render = [&, seen, vram_written,
+-                         one_shot_done](const std::vector<std::uint32_t>& stream) mutable {
++                         one_shot_done](std::vector<std::uint32_t>& stream) mutable {
+             if (one_shot_done)
+                 return;
+             ++seen;
+@@ -2830,7 +2850,7 @@ int main(int argc, char** argv) {
+         }
+         std::printf("F1 (or a pad's select button; Minus on the Switch) opens the menu\n");
+         auto previous_render = std::move(pvr.on_render);
+-        pvr.on_render = [&live, previous_render](const std::vector<std::uint32_t>& stream) {
++        pvr.on_render = [&live, previous_render](std::vector<std::uint32_t>& stream) {
+             if (previous_render)
+                 previous_render(stream);
+             live->render(stream);
+diff --git a/runtime/include/dream/runtime/pvr/core.h b/runtime/include/dream/runtime/pvr/core.h
+index 8c7b276..c79bb89 100644
+--- a/runtime/include/dream/runtime/pvr/core.h
++++ b/runtime/include/dream/runtime/pvr/core.h
+@@ -93,7 +93,9 @@ public:
+     std::function<void()> on_first_ta_data;
+     // Called when the guest starts a render, with the parameter stream that render will draw.
+     // The renderer (and the launcher's --dump-ta) hangs off this.
+-    std::function<void(const std::vector<std::uint32_t>& stream)> on_render;
++    // CT2-nx (switch-test3): the consumer may take the words (swap them out), leaving the stream
++    // empty; the render's duration is worked out from the size before the call.
++    std::function<void(std::vector<std::uint32_t>& stream)> on_render;
+     // Counters
+     std::uint64_t renders = 0, renders_done = 0, frame_swaps = 0, yuv_words = 0, texture_words = 0,
+                   list_inits = 0;
+diff --git a/runtime/include/dream/runtime/sh4/abi.h b/runtime/include/dream/runtime/sh4/abi.h
+index a1db0ca..e9dd589 100644
+--- a/runtime/include/dream/runtime/sh4/abi.h
++++ b/runtime/include/dream/runtime/sh4/abi.h
+@@ -67,6 +67,12 @@ void jump_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target);
+ // run_guest runs the program from `entry` until control returns to the PR it was started with,
+ // re-entering translated code through resume_at after every non-local return.
+ [[noreturn]] void nonlocal_return(Ctx& c, ::dream::Memory& m, std::uint32_t pc);
++// CT2-nx (switch-test3): how many non-local returns went straight to run_guest (longjmp) and how
++// many were thrown (a frame that needs unwinding was live).
++struct NonLocalStats {
++    std::uint64_t fast = 0, thrown = 0;
++};
++NonLocalStats nonlocal_stats();
+ 
+ // SA-nx: a tail jump (bra, bt/bf, a fall-through into another function, or a computed jmp/braf;
+ // discovery keeps shared epilogues as functions of their own) leaves PR at whatever the last call
+diff --git a/runtime/src/gdrom/disc.cpp b/runtime/src/gdrom/disc.cpp
+index ae97d20..04b2479 100644
+--- a/runtime/src/gdrom/disc.cpp
++++ b/runtime/src/gdrom/disc.cpp
+@@ -476,7 +476,9 @@ private:
+         std::vector<std::uint8_t> data;
+         bool ready = false, ok = false;
+     };
+-    static constexpr std::uint32_t kAhead = 24;
++    // CT2-nx (switch-test3): 64 ahead (was 24). Crazy Taxi 2 streams more than Crazy Taxi, and the
++    // game thread waited on the worker for about 2% of switch-test2's slow stretches.
++    static constexpr std::uint32_t kAhead = 64;
+     static constexpr std::size_t kMaxHunks = 2048;  // about 40 MB with 8-frame hunks
+ 
+     std::shared_ptr<Hunk> hunk_for(std::uint32_t hunk) {
+diff --git a/runtime/src/pvr/core.cpp b/runtime/src/pvr/core.cpp
+index 3d5d39d..876a4c2 100644
+--- a/runtime/src/pvr/core.cpp
++++ b/runtime/src/pvr/core.cpp
+@@ -174,9 +174,10 @@ void Core::reset() {
+ 
+ void Core::start_render() {
+     ++renders;
++    const std::size_t words = ta.stream.size();  // CT2-nx: on_render may take the stream
+     if (on_render)
+         on_render(ta.stream);
+-    const std::uint64_t cycles = render_base_cycles + render_cycles_per_word * ta.stream.size();
++    const std::uint64_t cycles = render_base_cycles + render_cycles_per_word * words;
+     sched_.request(render_event_, cycles);
+ }
+ 
+diff --git a/runtime/src/sh4/abi_bare.cpp b/runtime/src/sh4/abi_bare.cpp
+index cd4d6ef..76971dd 100644
+--- a/runtime/src/sh4/abi_bare.cpp
++++ b/runtime/src/sh4/abi_bare.cpp
+@@ -1,6 +1,7 @@
+ // Harness implementation of the emitted-code ABI: a function table, direct calls, and hard
+ // failures for anything that needs the real runtime (exceptions, interrupts, untranslated code).
+ #include <algorithm>
++#include <csetjmp>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <stdexcept>
+@@ -320,13 +321,48 @@ bool trace_nonlocal() {
+     static const bool on = std::getenv("DREAM_TRACE_NONLOCAL") != nullptr;
+     return on;
+ }
++
++// CT2-nx (switch-test3): a non-local return straight to run_guest. Crazy Taxi 2's task system
++// longjmps (the game's own setjmp/longjmp at 0x0C095CCC/0x0C095C58) many times a frame, and
++// throwing NonLocalReturn for each was about 4% of the game thread in switch-test2's slow
++// stretches, almost all of it in the unwinder. When nothing between the innermost run_guest and
++// the returning code needs unwinding, nonlocal_return jumps there with longjmp instead.
++//
++// What may lie between: translated functions (plain data only: no destructors, no handlers) and
++// the runtime's own plain dispatch (call_indirect's direct call, jump_indirect, resume_at,
++// idle_empty_fn). Every runtime frame that does need unwinding holds an UnwindGuard while it runs
++// guest code (call_indirect's resume path, which restores g_call_into; each hook: interrupts,
++// TRAPA, RTE, the interpreter). run_guest notes the guard count when it arms; a count that has
++// moved since means such a frame is live, and the return throws as before.
++thread_local int g_unwind_guard = 0;
++struct UnwindGuard {
++    UnwindGuard() noexcept { ++g_unwind_guard; }
++    ~UnwindGuard() { --g_unwind_guard; }
++    UnwindGuard(const UnwindGuard&) = delete;
++    UnwindGuard& operator=(const UnwindGuard&) = delete;
++};
++struct FastReturn {
++    std::jmp_buf jb;
++    int guard_at = 0;
++    std::uint32_t pc = 0;
++};
++thread_local FastReturn* g_fast = nullptr;
++NonLocalStats g_nonlocal_stats;
+ }  // namespace
+ 
++NonLocalStats nonlocal_stats() { return g_nonlocal_stats; }
++
+ void nonlocal_return(Ctx& c, ::dream::Memory&, std::uint32_t pc) {
+     if (trace_nonlocal())
+         std::fprintf(stderr, "nonlocal: rts from pc 0x%08x to 0x%08x (r15 0x%08x)\n", c.pc, pc,
+                      c.r[15]);
+     c.pc = pc;
++    if (FastReturn* f = g_fast; f && f->guard_at == g_unwind_guard) {
++        ++g_nonlocal_stats.fast;
++        f->pc = pc;
++        std::longjmp(f->jb, 1);
++    }
++    ++g_nonlocal_stats.thrown;
+     throw NonLocalReturn{pc};
+ }
+ 
+@@ -342,10 +378,12 @@ thread_local std::uint32_t g_call_into = 0xFFFFFFFFu;
+ void resume_miss(Ctx& c, ::dream::Memory& m, std::uint32_t pc) {
+     if (g_hooks && pc == g_call_into) {
+         g_call_into = 0xFFFFFFFFu;
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_untranslated(c, m, pc);
+         return;
+     }
+     if (g_hooks) {
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_resume(c, m, pc);
+         return;
+     }
+@@ -380,9 +418,26 @@ namespace {
+ template <typename Start>
+ void run_guest_impl(Ctx& c, ::dream::Memory& m, Start start) {
+     const std::uint32_t stop_pr = c.pr;
+-    std::uint32_t pc = 0;
+-    bool resumed = false;
++    // CT2-nx: volatile, being live across setjmp.
++    volatile std::uint32_t pc = 0;
++    volatile bool resumed = false;
++    // CT2-nx (switch-test3): the target of fast non-local returns (see FastReturn), restored to
++    // the enclosing run_guest's however this one ends.
++    FastReturn fast;
++    struct Restore {
++        FastReturn* outer;
++        ~Restore() { g_fast = outer; }
++    } restore{g_fast};
+     for (;;) {
++        fast.guard_at = g_unwind_guard;
++        if (setjmp(fast.jb) != 0) {
++            if (fast.pc == stop_pr)
++                return;
++            pc = fast.pc;
++            resumed = true;
++            continue;
++        }
++        g_fast = &fast;
+         try {
+             if (!resumed) {
+                 start();
+@@ -448,6 +503,7 @@ void call_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target) {
+             // interpreted only until it returns (see g_call_into).
+             const std::uint32_t outer = g_call_into;
+             g_call_into = target;
++            UnwindGuard guard;  // CT2-nx: the handler below must see a non-local return
+             try {
+                 e->resume(c, m, target);
+             } catch (...) {
+@@ -459,6 +515,7 @@ void call_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target) {
+         }
+     }
+     if (g_hooks) {
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_untranslated(c, m, target);
+         return;
+     }
+@@ -483,6 +540,7 @@ void jump_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target) {
+ 
+ void deliver_irq(Ctx& c, ::dream::Memory& m) {
+     if (g_hooks) {
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_poll(c, m);
+         return;
+     }
+@@ -491,6 +549,7 @@ void deliver_irq(Ctx& c, ::dream::Memory& m) {
+ 
+ void trapa(Ctx& c, ::dream::Memory& m, std::uint32_t imm) {
+     if (g_hooks) {
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_trapa(c, m, imm);
+         return;
+     }
+@@ -501,6 +560,7 @@ void trapa(Ctx& c, ::dream::Memory& m, std::uint32_t imm) {
+ bool rte(Ctx& c, ::dream::Memory& m) {
+     if (g_hooks) {
+         const bool unwind = g_hooks->in_exception_frame();
++        UnwindGuard guard;  // CT2-nx
+         g_hooks->on_rte(c, m);
+         return unwind;
+     }
