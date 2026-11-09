@@ -2,6 +2,24 @@
 
 Newest first. One entry per session, with the evidence behind each decision.
 
+## 2026-11-08: release 0.5.0 candidate
+
+- Mark: happy with every item on the coverage checklist. His coverage-run logs were not copied
+  over (switchlogs still holds switch-test3's two runs: 0 untranslated targets, the 5 known
+  unmapped modem probes, 0 texture failures, 0 dropped audio blocks, clean exits).
+- `RELEASE=1 ./switch/docker_build.sh`: CT2_RELEASE (no report, no profiler, --quick-exit), 3
+  steps on top of switch-test3. Checked: renderer and guard band strings present, --quick-exit,
+  NACP "Crazy Taxi 2 (CT2-nx)" by CT2-nx, version 0.5.0. Unlike CTDC-nx 0.5.0 no interpreter
+  spots: 0 untranslated call targets.
+- CT2-nx-0.5.0.zip (switch/crazytaxi2/: NRO, toml, README.txt, COPYING.txt,
+  disc/PUT_YOUR_DISC_HERE.txt), sha256
+  ed9a2d64be7f61912d24b9eb74d8e211960d20df5d4128a8df758ee619b1a3d7; NRO 87,191,088 bytes, sha256
+  97ade87bbcbce9fa5319013857c363b43b6f5f8597f61355726903938df9bb45. Both and release_notes.md in
+  C:\CT2-nx\out\release\, zip hash verified there. ELF kept as
+  out/crazytaxi2-switch-0.5.0.elf.
+- README rewritten for the release. Next: clean-install test on Mark's Switch, then Mark
+  publishes v0.5.0.
+
 ## 2026-11-06: switch-test3 results; default clock 1224 MHz
 
 - switch-test3 (NRO sha256 529838880a20cf3c4ad18c04398edcdc9d53fa096914452d64b522af933c6704,
